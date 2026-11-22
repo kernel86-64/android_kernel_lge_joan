@@ -218,8 +218,46 @@ adreno_iommu_create_vm(struct msm_gpu *gpu,
 	start = max_t(u64, SZ_16M, geometry->aperture_start);
 	size = geometry->aperture_end - start + 1;
 
-	vm = msm_gem_vm_create(gpu->dev, mmu, "gpu", start & GENMASK_ULL(48, 0),
-			       size, true);
+	/*
+	 * Use the aperture base as it is, and clamp the size instead of masking
+	 * the base into GENMASK_ULL(48, 0).
+	 *
+	 * That mask is 49 bits, so it keeps bit 48.  Measured on msm8998, whose
+	 * GPU SMMU reports a TTBR1 aperture of
+	 * 0xffff000000000000-0xffffffffffffffff, it produced a base of exactly
+	 * 2^48 -- an address in neither half of the split address space, since
+	 * the hardware translates 48-bit VAs (TTBR0 0..2^48-1, TTBR1
+	 * 0xffff000000000000 and up).  The GPU then truncated those VAs to 48
+	 * bits, so a global buffer at 2^48 + X was accessed as X, looked up in
+	 * TTBR0 where nothing maps it, and faulted.
+	 *
+	 * The aperture ends at U64_MAX: start + size is 2^64, which wraps to 0
+	 * and leaves drm_mm with a broken range.  Clamp the size to keep the
+	 * range representable while leaving the base in the half the hardware
+	 * expects.
+	 */
+	if (start + size < start)
+		size = U64_MAX - start;
+
+	/*
+	 * The GPU issues 48-bit VAs.  Within the TTBR1 aperture the SMMU
+	 * reconstructs the full 64-bit VA by sign-extending the top bit of the
+	 * upstream address (SEP), so the only TTBR1 VAs a 48-bit master can
+	 * form have bit 47 set: 0xffff800000000000 and up.  The lower half of
+	 * the aperture is unreachable: a buffer placed there is issued with bit
+	 * 47 clear, sign-extends to a low address, and faults in TTBR0.
+	 */
+	if (start == 0xffff000000000000ULL) {
+		start = 0xffff800000000000ULL;
+		size = U64_MAX - start;
+	}
+
+	DRM_DEV_INFO(&pdev->dev,
+		     "gpu aspace: aperture %#llx-%#llx, base %#llx, size %#llx\n",
+		     geometry->aperture_start, geometry->aperture_end,
+		     start, size);
+
+	vm = msm_gem_vm_create(gpu->dev, mmu, "gpu", start, size, true);
 
 	if (IS_ERR(vm) && !IS_ERR(mmu))
 		mmu->funcs->destroy(mmu);
