@@ -261,7 +261,6 @@ static int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie,
 	struct io_pgtable *pgtable = io_pgtable_ops_to_pgtable(smmu_domain->pgtbl_ops);
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
-	int ret;
 
 	/* The domain must have split pagetables already enabled */
 	if (cb->tcr[0] & ARM_SMMU_TCR_EPD1)
@@ -291,15 +290,13 @@ static int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie,
 		cb->ttbr[0] |= FIELD_PREP(ARM_SMMU_TTBRn_ASID, cb->cfg->asid);
 	}
 
-	ret = pm_runtime_resume_and_get(smmu_domain->smmu->dev);
-	if (ret < 0) {
-		dev_err(smmu_domain->smmu->dev, "failed to get runtime PM: %d\n", ret);
-		return -ENODEV;
-	}
-
+	/*
+	 * The MSM8998 GPU SMMU is pinned powered.  Do not runtime-resume it
+	 * around the context-bank write: the firmware XPU-protects the SMMU
+	 * window once the GPU is up, and touching it after a runtime cycle
+	 * leaves the GPU's per-instance pagetable without its mapping.
+	 */
 	arm_smmu_write_context_bank(smmu_domain->smmu, cb->cfg->cbndx);
-
-	pm_runtime_put_autosuspend(smmu_domain->smmu->dev);
 
 	return 0;
 }
