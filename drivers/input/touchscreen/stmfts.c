@@ -14,7 +14,11 @@
 #include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
+#include <linux/unaligned.h>
 #include <linux/regulator/consumer.h>
+
+#include <drm/drm_panel.h>
 
 /* I2C commands */
 #define STMFTS_READ_INFO			0x80
@@ -64,10 +68,57 @@
 #define STMFTS_MASK_KEY_MENU			0x01
 #define STMFTS_MASK_KEY_BACK			0x02
 
+#define STMFTS_RESET_TIMEOUT_MS	300
+
 #define STMFTS_EVENT_SIZE	8
 #define STMFTS_STACK_DEPTH	32
 #define STMFTS_DATA_MAX_SIZE	(STMFTS_EVENT_SIZE * STMFTS_STACK_DEPTH)
 #define STMFTS_MAX_FINGERS	10
+
+/*
+ * Some FingerTipS variants (notably the FTM4 fitted to LG joan) expose a
+ * register-write protocol alongside the single-byte command set, and will not
+ * assert their interrupt line until interrupt generation has been enabled in
+ * their own control register.
+ */
+#define STMFTS_WRITE_REG		0xb6
+#define STMFTS_REG_SYSTEM_RESET		0x0028
+#define STMFTS_SYSTEM_RESET_VALUE	0x80
+#define STMFTS_REG_INT_CTRL		0x002c
+#define STMFTS_INT_ENABLE		0x48
+#define STMFTS_READ_ONE_EVENT		0x85
+#define STMFTS_FTS3670_READY_RETRIES	50
+#define STMFTS_FLUSH_BUFFER		0xa1
+#define STMFTS_RELEASE_INFO		0xaa
+#define STMFTS_EV_INTERNAL_RELEASE_INFO	0x14
+#define STMFTS_EV_EXTERNAL_RELEASE_INFO	0x15
+#define STMFTS_INT_DISABLE		0x08
+#define STMFTS_SENSE_OFF		0x92
+#define STMFTS_SENSE_ON			0x93
+
+/**
+ * struct stmfts_variant - per-compatible controller behaviour
+ * @fts3670_bringup: controller needs a register-write reset and an explicit
+ *	interrupt-enable before it will answer any command
+ * @fts3670_contact_layout: contact events pack both coordinate low nibbles into
+ *	byte 3, and order the trailing fields differently
+ * @fts3670_identity: chip id and versions come from a register read and
+ *	release-info events rather than the STMFTS_READ_INFO block read
+ */
+struct stmfts_variant {
+	bool fts3670_bringup;
+	bool fts3670_contact_layout;
+	bool fts3670_identity;
+};
+
+static const struct stmfts_variant stmfts_variant_stmfts = {
+};
+
+static const struct stmfts_variant stmfts_variant_fts3670 = {
+	.fts3670_bringup = true,
+	.fts3670_contact_layout = true,
+	.fts3670_identity = true,
+};
 #define STMFTS_DEV_NAME		"stmfts"
 
 static const struct regulator_bulk_data stmfts_supplies[] = {
@@ -76,6 +127,7 @@ static const struct regulator_bulk_data stmfts_supplies[] = {
 };
 
 struct stmfts_data {
+	const struct stmfts_variant *variant;
 	struct i2c_client *client;
 	struct input_dev *input;
 	struct gpio_desc *reset_gpio;
@@ -102,10 +154,15 @@ struct stmfts_data {
 
 	struct completion cmd_done;
 
+	struct drm_panel_follower panel_follower;
+
 	bool use_key;
 	bool led_status;
 	bool hover_enabled;
 	bool running;
+	bool powered;
+	bool follow_panel;
+	bool panel_on;
 };
 
 static int stmfts_brightness_set(struct led_classdev *led_cdev,
@@ -174,12 +231,35 @@ static void stmfts_report_contact_event(struct stmfts_data *sdata,
 					const u8 event[])
 {
 	u8 slot_id = (event[0] & STMFTS_MASK_TOUCH_ID) >> 4;
-	u16 x = event[1] | ((event[2] & STMFTS_MASK_X_MSB) << 8);
-	u16 y = (event[2] >> 4) | (event[3] << 4);
-	u8 maj = event[4];
-	u8 min = event[5];
-	u8 orientation = event[6];
-	u8 area = event[7];
+	int maj, min, orientation;
+	u8 pressure;
+	u16 x, y;
+
+	if (sdata->variant->fts3670_contact_layout) {
+		/*
+		 * Byte 3 carries the low nibble of both coordinates, with
+		 * bytes 1 and 2 holding the high bytes.
+		 *
+		 * The trailing fields are pressure, a *signed* orientation,
+		 * and a 10-bit major axis whose two least significant bits
+		 * live in the top of byte 7. The remaining six bits of byte 7
+		 * are a fraction that scales the minor axis against the major
+		 * one - they are not a standalone value.
+		 */
+		x = (event[1] << 4) | ((event[3] & 0xf0) >> 4);
+		y = (event[2] << 4) | (event[3] & 0x0f);
+		pressure = event[4];
+		orientation = (s8)event[5];
+		maj = (event[6] << 2) | ((event[7] >> 6) & 0x03);
+		min = (event[7] & 0x3f) * maj / 63;
+	} else {
+		x = event[1] | ((event[2] & STMFTS_MASK_X_MSB) << 8);
+		y = (event[2] >> 4) | (event[3] << 4);
+		maj = event[4];
+		min = event[5];
+		orientation = event[6];
+		pressure = event[7];
+	}
 
 	input_mt_slot(sdata->input, slot_id);
 
@@ -188,10 +268,8 @@ static void stmfts_report_contact_event(struct stmfts_data *sdata,
 	input_report_abs(sdata->input, ABS_MT_POSITION_Y, y);
 	input_report_abs(sdata->input, ABS_MT_TOUCH_MAJOR, maj);
 	input_report_abs(sdata->input, ABS_MT_TOUCH_MINOR, min);
-	input_report_abs(sdata->input, ABS_MT_PRESSURE, area);
+	input_report_abs(sdata->input, ABS_MT_PRESSURE, pressure);
 	input_report_abs(sdata->input, ABS_MT_ORIENTATION, orientation);
-
-	input_sync(sdata->input);
 }
 
 static void stmfts_report_contact_release(struct stmfts_data *sdata,
@@ -201,7 +279,29 @@ static void stmfts_report_contact_release(struct stmfts_data *sdata,
 
 	input_mt_slot(sdata->input, slot_id);
 	input_mt_report_slot_inactive(sdata->input);
+}
 
+/*
+ * Drop every contact the controller had reported.
+ *
+ * Powering the controller down mid-touch (the panel does this on blank)
+ * means the leave event for anything still down is never sent, so the
+ * slot stays occupied for as long as the input device lives. Userspace
+ * then sees a finger permanently on the screen: gestures still work,
+ * because they are computed from deltas, but taps never register --
+ * every new contact looks like a second finger joining an ongoing
+ * multi-touch gesture rather than a press.
+ */
+static void stmfts_release_all_contacts(struct stmfts_data *sdata)
+{
+	int i;
+
+	for (i = 0; i < STMFTS_MAX_FINGERS; i++) {
+		input_mt_slot(sdata->input, i);
+		input_mt_report_slot_inactive(sdata->input);
+	}
+
+	input_mt_sync_frame(sdata->input);
 	input_sync(sdata->input);
 }
 
@@ -246,6 +346,7 @@ static void stmfts_report_key_event(struct stmfts_data *sdata, const u8 event[])
 
 static void stmfts_parse_events(struct stmfts_data *sdata)
 {
+	bool mt_event = false;
 	int i;
 
 	for (i = 0; i < STMFTS_STACK_DEPTH; i++) {
@@ -260,17 +361,19 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
 
 		case STMFTS_EV_NO_EVENT:
 		case STMFTS_EV_DEBUG:
-			return;
+			goto out;
 		}
 
 		switch (event[0] & STMFTS_MASK_EVENT_ID) {
 		case STMFTS_EV_MULTI_TOUCH_ENTER:
 		case STMFTS_EV_MULTI_TOUCH_MOTION:
 			stmfts_report_contact_event(sdata, event);
+			mt_event = true;
 			break;
 
 		case STMFTS_EV_MULTI_TOUCH_LEAVE:
 			stmfts_report_contact_release(sdata, event);
+			mt_event = true;
 			break;
 
 		case STMFTS_EV_HOVER_ENTER:
@@ -284,16 +387,45 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
 			break;
 
 		case STMFTS_EV_ERROR:
-			dev_warn(&sdata->client->dev,
-				 "error code: 0x%x%x%x%x%x%x",
-				 event[6], event[5], event[4],
-				 event[3], event[2], event[1]);
+			/*
+			 * event[1] is the error type. The FTS firmware
+			 * defines 0x01..0x0b (M3, AFE, flash corruption,
+			 * ITO, OSC trim, RTOS, CX tune, lib, lockdown); the
+			 * LG V30's controller also reports other types, e.g.
+			 * 0xba on every wake, which LG's ftm4 driver routes
+			 * to its debug-message handler rather than treating
+			 * as an error. Do the same: warn on defined types,
+			 * debug-log the rest. Zero-pad each byte so the
+			 * payload keeps its leading zeroes.
+			 */
+			if (event[1] >= 0x01 && event[1] <= 0x0b)
+				dev_warn_ratelimited(&sdata->client->dev,
+						     "error type %#04x: %02x %02x %02x %02x %02x\n",
+						     event[1], event[2], event[3],
+						     event[4], event[5], event[6]);
+			else
+				dev_dbg(&sdata->client->dev,
+					"status %#04x: %02x %02x %02x %02x %02x\n",
+					event[1], event[2], event[3],
+					event[4], event[5], event[6]);
 			break;
 
 		default:
 			dev_err(&sdata->client->dev,
 				"unknown event %#02x\n", event[0]);
 		}
+	}
+
+out:
+	if (mt_event) {
+		/*
+		 * input_mt_init_slots() advertises BTN_TOUCH and the ABS_X/
+		 * ABS_Y pointer emulation, but they are only ever emitted
+		 * from the frame sync. Without this the device claims a
+		 * capability it never delivers.
+		 */
+		input_mt_sync_frame(sdata->input);
+		input_sync(sdata->input);
 	}
 }
 
@@ -305,17 +437,19 @@ static irqreturn_t stmfts_irq_handler(int irq, void *dev)
 	guard(mutex)(&sdata->mutex);
 
 	err = stmfts_read_events(sdata);
-	if (unlikely(err))
+	if (unlikely(err)) {
 		dev_err(&sdata->client->dev,
 			"failed to read events: %d\n", err);
-	else
+	} else {
 		stmfts_parse_events(sdata);
+	}
 
 	return IRQ_HANDLED;
 }
 
 static int stmfts_command(struct stmfts_data *sdata, const u8 cmd)
 {
+	unsigned long left;
 	int err;
 
 	reinit_completion(&sdata->cmd_done);
@@ -324,9 +458,37 @@ static int stmfts_command(struct stmfts_data *sdata, const u8 cmd)
 	if (err)
 		return err;
 
-	if (!wait_for_completion_timeout(&sdata->cmd_done,
-					 msecs_to_jiffies(1000)))
+	left = wait_for_completion_timeout(&sdata->cmd_done,
+					   msecs_to_jiffies(1000));
+	if (!left)
 		return -ETIMEDOUT;
+
+	return 0;
+}
+
+/*
+ * Turn on the sensing the controller needs for an open input device. The
+ * power-on sequence ends with SLEEP_IN, so this has to follow every power-on
+ * while the device is open, not just the first open: on Android the evdev
+ * stays open across blank/unblank, and the panel driver repowers the
+ * controller at each unblank.
+ */
+static int stmfts_start_sensing(struct stmfts_data *sdata)
+{
+	int err;
+
+	err = i2c_smbus_write_byte(sdata->client, STMFTS_MS_MT_SENSE_ON);
+	if (err)
+		return err;
+
+	if (sdata->hover_enabled &&
+	    i2c_smbus_write_byte(sdata->client, STMFTS_SS_HOVER_SENSE_ON))
+		dev_warn(&sdata->client->dev, "failed to enable hover\n");
+
+	/* I can still use only the touch screen */
+	if (sdata->use_key &&
+	    i2c_smbus_write_byte(sdata->client, STMFTS_MS_KEY_SENSE_ON))
+		dev_warn(&sdata->client->dev, "failed to enable touchkey\n");
 
 	return 0;
 }
@@ -340,31 +502,19 @@ static int stmfts_input_open(struct input_dev *dev)
 	if (err)
 		return err;
 
-	err = i2c_smbus_write_byte(sdata->client, STMFTS_MS_MT_SENSE_ON);
-	if (err) {
-		pm_runtime_put_sync(&sdata->client->dev);
-		return err;
-	}
-
-	scoped_guard(mutex, &sdata->mutex) {
+	scoped_guard(mutex, &sdata->mutex)
 		sdata->running = true;
 
-		if (sdata->hover_enabled) {
-			err = i2c_smbus_write_byte(sdata->client,
-						   STMFTS_SS_HOVER_SENSE_ON);
-			if (err)
-				dev_warn(&sdata->client->dev,
-					 "failed to enable hover\n");
-		}
-	}
-
-	if (sdata->use_key) {
-		err = i2c_smbus_write_byte(sdata->client,
-					   STMFTS_MS_KEY_SENSE_ON);
-		if (err)
-			/* I can still use only the touch screen */
-			dev_warn(&sdata->client->dev,
-				 "failed to enable touchkey\n");
+	/*
+	 * When following the panel, the controller is off while the panel
+	 * is; stmfts_panel_prepared() starts sensing once it is powered.
+	 */
+	err = sdata->powered ? stmfts_start_sensing(sdata) : 0;
+	if (err) {
+		scoped_guard(mutex, &sdata->mutex)
+			sdata->running = false;
+		pm_runtime_put_sync(&sdata->client->dev);
+		return err;
 	}
 
 	return 0;
@@ -374,6 +524,14 @@ static void stmfts_input_close(struct input_dev *dev)
 {
 	struct stmfts_data *sdata = input_get_drvdata(dev);
 	int err;
+
+	if (!sdata->powered) {
+		/* The panel has the controller off; there is nothing to stop. */
+		scoped_guard(mutex, &sdata->mutex)
+			sdata->running = false;
+		pm_runtime_put_sync(&sdata->client->dev);
+		return;
+	}
 
 	err = i2c_smbus_write_byte(sdata->client, STMFTS_MS_MT_SENSE_OFF);
 	if (err)
@@ -522,10 +680,103 @@ static struct attribute *stmfts_sysfs_attrs[] = {
 };
 ATTRIBUTE_GROUPS(stmfts_sysfs);
 
+static int stmfts_write_reg(struct stmfts_data *sdata, u16 reg, u8 value)
+{
+	u8 frame[4] = { STMFTS_WRITE_REG, reg >> 8, reg & 0xff, value };
+	struct i2c_msg msg = {
+		.addr = sdata->client->addr,
+		.len = sizeof(frame),
+		.buf = frame,
+	};
+	int err;
+
+	err = i2c_transfer(sdata->client->adapter, &msg, 1);
+	if (err < 0)
+		return err;
+
+	return err == 1 ? 0 : -EIO;
+}
+
+/*
+ * The FTS3670 does not implement the STMFTS_READ_INFO block read, so the
+ * generic path returns success with a zeroed chip id. Identity instead comes
+ * from a register read for the chip id, and from release-info events emitted
+ * in response to STMFTS_RELEASE_INFO.
+ *
+ * The threaded IRQ handler drains the event FIFO, so sensing and the
+ * interrupt are held off across the sequence or the release-info events are
+ * consumed before they can be read.
+ */
+static int stmfts_fts3670_read_identity(struct stmfts_data *sdata)
+{
+	u8 chip_req[3] = { STMFTS_WRITE_REG, 0x00, 0x04 };
+	u8 rd = STMFTS_READ_ONE_EVENT;
+	u8 val[7] = {};
+	u8 ev[STMFTS_EVENT_SIZE];
+	struct i2c_msg chip_msg[2] = {
+		{ .addr = sdata->client->addr, .len = sizeof(chip_req),
+		  .buf = chip_req },
+		{ .addr = sdata->client->addr, .flags = I2C_M_RD,
+		  .len = sizeof(val), .buf = val },
+	};
+	int err, i;
+
+	err = i2c_transfer(sdata->client->adapter, chip_msg,
+			   ARRAY_SIZE(chip_msg));
+	if (err != ARRAY_SIZE(chip_msg))
+		return err < 0 ? err : -EIO;
+
+	sdata->chip_id = get_unaligned_be16(&val[1]);
+
+	stmfts_write_reg(sdata, STMFTS_REG_INT_CTRL, STMFTS_INT_DISABLE);
+	i2c_smbus_write_byte(sdata->client, STMFTS_SENSE_OFF);
+	disable_irq(sdata->client->irq);
+	msleep(50);
+
+	i2c_smbus_write_byte(sdata->client, STMFTS_FLUSH_BUFFER);
+	msleep(50);
+	i2c_smbus_write_byte(sdata->client, STMFTS_RELEASE_INFO);
+	msleep(50);
+
+	for (i = 0; i < STMFTS_FTS3670_READY_RETRIES; i++) {
+		struct i2c_msg msg[2] = {
+			{ .addr = sdata->client->addr, .len = 1, .buf = &rd },
+			{ .addr = sdata->client->addr, .flags = I2C_M_RD,
+			  .len = sizeof(ev), .buf = ev },
+		};
+
+		if (i2c_transfer(sdata->client->adapter, msg,
+				 ARRAY_SIZE(msg)) != ARRAY_SIZE(msg))
+			break;
+
+		if (!ev[0])
+			break;
+
+		if (ev[0] == STMFTS_EV_INTERNAL_RELEASE_INFO) {
+			sdata->fw_ver = get_unaligned_be16(&ev[3]);
+			sdata->config_id = ev[6];
+			sdata->config_ver = ev[5];
+		} else if (ev[0] == STMFTS_EV_EXTERNAL_RELEASE_INFO) {
+			sdata->chip_ver = ev[1];
+		}
+
+		msleep(10);
+	}
+
+	i2c_smbus_write_byte(sdata->client, STMFTS_SENSE_ON);
+	stmfts_write_reg(sdata, STMFTS_REG_INT_CTRL, STMFTS_INT_ENABLE);
+	enable_irq(sdata->client->irq);
+
+	return 0;
+}
+
 static int stmfts_read_system_info(struct stmfts_data *sdata)
 {
 	int err;
 	u8 reg[8];
+
+	if (sdata->variant->fts3670_identity)
+		return stmfts_fts3670_read_identity(sdata);
 
 	err = i2c_smbus_read_i2c_block_data(sdata->client, STMFTS_READ_INFO,
 					    sizeof(reg), reg);
@@ -543,20 +794,77 @@ static int stmfts_read_system_info(struct stmfts_data *sdata)
 	return 0;
 }
 
-static void stmfts_reset(struct stmfts_data *sdata)
+static int stmfts_fts3670_wait_ready(struct stmfts_data *sdata)
 {
-	gpiod_set_value_cansleep(sdata->reset_gpio, 1);
-	msleep(20);
+	u8 cmd = STMFTS_READ_ONE_EVENT;
+	u8 event[STMFTS_EVENT_SIZE];
+	int err, i;
 
-	gpiod_set_value_cansleep(sdata->reset_gpio, 0);
-	msleep(50);
+	for (i = 0; i < STMFTS_FTS3670_READY_RETRIES; i++) {
+		struct i2c_msg msg[2] = {
+			{
+				.addr = sdata->client->addr,
+				.len = 1,
+				.buf = &cmd,
+			},
+			{
+				.addr = sdata->client->addr,
+				.flags = I2C_M_RD,
+				.len = sizeof(event),
+				.buf = event,
+			},
+		};
+
+		err = i2c_transfer(sdata->client->adapter, msg,
+				   ARRAY_SIZE(msg));
+		if (err == ARRAY_SIZE(msg) &&
+		    event[0] == STMFTS_EV_CONTROLLER_READY)
+			return 0;
+
+		msleep(20);
+	}
+
+	return -ETIMEDOUT;
+}
+
+/*
+ * The FTS3670 ignores the single-byte command set until it has been reset
+ * through its register interface and told to generate interrupts. Without
+ * the interrupt-enable write it emits only its unconditional power-on ready
+ * event, after which every command waiting on cmd_done times out.
+ */
+static int stmfts_fts3670_bringup(struct stmfts_data *sdata)
+{
+	int err;
+
+	err = stmfts_write_reg(sdata, STMFTS_REG_SYSTEM_RESET,
+			       STMFTS_SYSTEM_RESET_VALUE);
+	if (err)
+		return err;
+
+	msleep(10);
+
+	err = stmfts_fts3670_wait_ready(sdata);
+	if (err)
+		return err;
+
+	err = stmfts_write_reg(sdata, STMFTS_REG_INT_CTRL, STMFTS_INT_ENABLE);
+	if (err)
+		return err;
+
+	msleep(10);
+
+	return 0;
 }
 
 static int stmfts_configure(struct stmfts_data *sdata)
 {
 	int err;
 
-	err = stmfts_command(sdata, STMFTS_SYSTEM_RESET);
+	if (sdata->variant->fts3670_bringup)
+		err = stmfts_fts3670_bringup(sdata);
+	else
+		err = stmfts_command(sdata, STMFTS_SYSTEM_RESET);
 	if (err)
 		return err;
 
@@ -585,29 +893,81 @@ static int stmfts_configure(struct stmfts_data *sdata)
 
 static int stmfts_power_on(struct stmfts_data *sdata)
 {
+	unsigned int timeout;
 	int err;
+
+	/*
+	 * Both runtime PM and the panel driver drive the controller's power,
+	 * and either can get there first. Track the state here so the two
+	 * cannot double up: the bare enable_irq() below underflows the
+	 * interrupt's enable depth if the controller is already on, and each
+	 * extra call would leak a regulator enable reference.
+	 */
+	if (sdata->powered)
+		return 0;
+
+	if (sdata->reset_gpio) {
+		gpiod_set_value_cansleep(sdata->reset_gpio, 1);
+		/* a short delay before powering up */
+		usleep_range(1000, 1500);
+	}
 
 	err = regulator_bulk_enable(ARRAY_SIZE(stmfts_supplies),
 				    sdata->supplies);
 	if (err)
 		return err;
 
-	/*
-	 * The datasheet does not specify the power on time, but considering
-	 * that the reset time is < 10ms, I sleep 20ms to be sure
-	 */
-	msleep(20);
+	reinit_completion(&sdata->cmd_done);
 
-	if (sdata->reset_gpio)
-		stmfts_reset(sdata);
+	if (sdata->reset_gpio) {
+		/*
+		 * The datasheet does not specify the power on time, but
+		 * considering that the reset time is < 10ms, sleep for 20ms
+		 * to be sure before releasing reset line.
+		 */
+		msleep(20);
+		gpiod_set_value_cansleep(sdata->reset_gpio, 0);
 
-	err = stmfts_read_system_info(sdata);
-	if (err)
-		goto err_disable_regulators;
+		timeout = STMFTS_RESET_TIMEOUT_MS;
+	} else {
+		/*
+		 * We do not know the real controller state (was it powered
+		 * off or reset). Let's hope that this is enough time to
+		 * initialize.
+		 */
+		timeout = 70;
+	}
 
 	enable_irq(sdata->client->irq);
 
-	msleep(50);
+	if (sdata->variant->fts3670_bringup && sdata->reset_gpio) {
+		/*
+		 * The FTS3670 does not raise its interrupt for the power-on
+		 * ready event until stmfts_fts3670_bringup() enables it in
+		 * INT_CTRL, so cmd_done would never complete here. Poll the
+		 * event FIFO for it instead.
+		 */
+		err = stmfts_fts3670_wait_ready(sdata);
+		if (err) {
+			dev_err(&sdata->client->dev, "controller not ready after reset\n");
+			goto err_disable_irq;
+		}
+	} else if (!wait_for_completion_timeout(&sdata->cmd_done,
+						msecs_to_jiffies(timeout))) {
+		if (sdata->reset_gpio) {
+			dev_err(&sdata->client->dev, "controller not ready after reset\n");
+			err = -ETIMEDOUT;
+			goto err_disable_irq;
+		}
+		/*
+		 * If we did not reset the controller ourselves continue
+		 * even if we did not receive "ready" message.
+		 */
+	}
+
+	err = stmfts_read_system_info(sdata);
+	if (err)
+		goto err_disable_irq;
 
 	err = stmfts_configure(sdata);
 	if (err)
@@ -619,11 +979,13 @@ static int stmfts_power_on(struct stmfts_data *sdata)
 	 */
 	(void)i2c_smbus_write_byte(sdata->client, STMFTS_SLEEP_IN);
 
+	sdata->powered = true;
+
 	return 0;
 
 err_disable_irq:
 	disable_irq(sdata->client->irq);
-err_disable_regulators:
+
 	regulator_bulk_disable(ARRAY_SIZE(stmfts_supplies), sdata->supplies);
 	return err;
 }
@@ -632,13 +994,64 @@ static void stmfts_power_off(void *data)
 {
 	struct stmfts_data *sdata = data;
 
+	if (!sdata->powered)
+		return;
+
+	sdata->powered = false;
+
 	disable_irq(sdata->client->irq);
+
+	/*
+	 * The interrupt is off, so nothing can report a leave event for a
+	 * contact that is still down. Release them here instead.
+	 */
+	stmfts_release_all_contacts(sdata);
 
 	if (sdata->reset_gpio)
 		gpiod_set_value_cansleep(sdata->reset_gpio, 1);
 
 	regulator_bulk_disable(ARRAY_SIZE(stmfts_supplies), sdata->supplies);
 }
+
+/*
+ * Power the controller together with the panel it sits on, when the DT
+ * links them with a "panel" phandle. The controller emits a spurious touch
+ * event during the display's power transitions while it stays awake (the
+ * evdev open keeps runtime PM active), which unblanks the screen on its
+ * own. Powered off before the panel is unprepared and re-initialized after
+ * it is prepared, it cannot, and it is in a known good state for the first
+ * taps.
+ */
+static int stmfts_panel_prepared(struct drm_panel_follower *follower)
+{
+	struct stmfts_data *sdata = container_of(follower, struct stmfts_data,
+						 panel_follower);
+	int err;
+
+	sdata->panel_on = true;
+
+	err = stmfts_power_on(sdata);
+	if (!err && sdata->running)
+		err = stmfts_start_sensing(sdata);
+
+	return err;
+}
+
+static int stmfts_panel_unpreparing(struct drm_panel_follower *follower)
+{
+	struct stmfts_data *sdata = container_of(follower, struct stmfts_data,
+						 panel_follower);
+
+	sdata->panel_on = false;
+	stmfts_power_off(sdata);
+
+	return 0;
+}
+
+static const struct drm_panel_follower_funcs stmfts_panel_follower_funcs = {
+	.panel_prepared = stmfts_panel_prepared,
+	.panel_unpreparing = stmfts_panel_unpreparing,
+};
 
 static int stmfts_enable_led(struct stmfts_data *sdata)
 {
@@ -681,6 +1094,10 @@ static int stmfts_probe(struct i2c_client *client)
 
 	i2c_set_clientdata(client, sdata);
 
+	sdata->variant = device_get_match_data(&client->dev);
+	if (!sdata->variant)
+		sdata->variant = &stmfts_variant_stmfts;
+
 	sdata->client = client;
 	mutex_init(&sdata->mutex);
 	init_completion(&sdata->cmd_done);
@@ -710,9 +1127,19 @@ static int stmfts_probe(struct i2c_client *client)
 	input_set_capability(sdata->input, EV_ABS, ABS_MT_POSITION_Y);
 	touchscreen_parse_properties(sdata->input, true, &sdata->prop);
 
-	input_set_abs_params(sdata->input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
-	input_set_abs_params(sdata->input, ABS_MT_TOUCH_MINOR, 0, 255, 0, 0);
-	input_set_abs_params(sdata->input, ABS_MT_ORIENTATION, 0, 255, 0, 0);
+	if (sdata->variant->fts3670_contact_layout) {
+		/*
+		 * This layout reports a 10-bit major axis, a minor axis
+		 * scaled against it, and a signed orientation.
+		 */
+		input_set_abs_params(sdata->input, ABS_MT_TOUCH_MAJOR, 0, 1023, 0, 0);
+		input_set_abs_params(sdata->input, ABS_MT_TOUCH_MINOR, 0, 1023, 0, 0);
+		input_set_abs_params(sdata->input, ABS_MT_ORIENTATION, -128, 127, 0, 0);
+	} else {
+		input_set_abs_params(sdata->input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+		input_set_abs_params(sdata->input, ABS_MT_TOUCH_MINOR, 0, 255, 0, 0);
+		input_set_abs_params(sdata->input, ABS_MT_ORIENTATION, 0, 255, 0, 0);
+	}
 	input_set_abs_params(sdata->input, ABS_MT_PRESSURE, 0, 255, 0, 0);
 	input_set_abs_params(sdata->input, ABS_DISTANCE, 0, 255, 0, 0);
 
@@ -722,8 +1149,15 @@ static int stmfts_probe(struct i2c_client *client)
 		input_set_capability(sdata->input, EV_KEY, KEY_BACK);
 	}
 
-	err = input_mt_init_slots(sdata->input,
-				  STMFTS_MAX_FINGERS, INPUT_MT_DIRECT);
+	/*
+	 * INPUT_MT_DROP_UNUSED: the controller does not always send a leave
+	 * event for every contact it opened, and a slot left occupied is
+	 * indistinguishable from a finger resting on the screen forever. It
+	 * does re-report every live contact on each scan, so letting the frame
+	 * sync drop whatever was not reported reconciles the state safely.
+	 */
+	err = input_mt_init_slots(sdata->input, STMFTS_MAX_FINGERS,
+				  INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
 	if (err)
 		return err;
 
@@ -752,6 +1186,21 @@ static int stmfts_probe(struct i2c_client *client)
 	err = devm_add_action_or_reset(dev, stmfts_power_off, sdata);
 	if (err)
 		return err;
+
+	if (drm_is_panel_follower(dev)) {
+		sdata->follow_panel = true;
+		sdata->panel_follower.funcs = &stmfts_panel_follower_funcs;
+
+		/* Calls stmfts_panel_prepared() now if the panel is already on */
+		err = devm_drm_panel_add_follower(dev, &sdata->panel_follower);
+		if (err)
+			return dev_err_probe(dev, err,
+					     "failed to follow the panel\n");
+
+		/* Otherwise stay off until the panel comes up */
+		if (!sdata->panel_on)
+			stmfts_power_off(sdata);
+	}
 
 	err = input_register_device(sdata->input);
 	if (err)
@@ -787,6 +1236,10 @@ static int stmfts_runtime_suspend(struct device *dev)
 	struct stmfts_data *sdata = dev_get_drvdata(dev);
 	int ret;
 
+	/* Already off with the panel */
+	if (!sdata->powered)
+		return 0;
+
 	ret = i2c_smbus_write_byte(sdata->client, STMFTS_SLEEP_IN);
 	if (ret)
 		dev_warn(dev, "failed to suspend device: %d\n", ret);
@@ -797,14 +1250,20 @@ static int stmfts_runtime_suspend(struct device *dev)
 static int stmfts_runtime_resume(struct device *dev)
 {
 	struct stmfts_data *sdata = dev_get_drvdata(dev);
-	struct i2c_client *client = sdata->client;
-	int ret;
 
-	ret = i2c_smbus_write_byte(client, STMFTS_SLEEP_OUT);
-	if (ret)
-		dev_err(dev, "failed to resume device: %d\n", ret);
+	/*
+	 * joan: a bare SLEEP_OUT does not reliably re-arm the controller
+	 * after later blank/wake cycles — it stays silent while runtime PM
+	 * thinks it is active (observed as a frozen keypad after wake #2,
+	 * 0 bytes on the evdev, runtime_status=active). Do the full
+	 * power_on re-init instead. Diagnostic: heavier per wake, TBD
+	 * whether the latency is acceptable vs. finding the exact
+	 * SLEEP_OUT failure mode.
+	 */
+	if (sdata->follow_panel && !sdata->panel_on)
+		return 0;
 
-	return ret;
+	return stmfts_power_on(sdata);
 }
 
 static int stmfts_suspend(struct device *dev)
@@ -819,8 +1278,17 @@ static int stmfts_suspend(struct device *dev)
 static int stmfts_resume(struct device *dev)
 {
 	struct stmfts_data *sdata = dev_get_drvdata(dev);
+	int err;
 
-	return stmfts_power_on(sdata);
+	/* stmfts_panel_prepared() powers us when the panel comes back */
+	if (sdata->follow_panel && !sdata->panel_on)
+		return 0;
+
+	err = stmfts_power_on(sdata);
+	if (!err && sdata->running)
+		err = stmfts_start_sensing(sdata);
+
+	return err;
 }
 
 static const struct dev_pm_ops stmfts_pm_ops = {
@@ -830,7 +1298,8 @@ static const struct dev_pm_ops stmfts_pm_ops = {
 
 #ifdef CONFIG_OF
 static const struct of_device_id stmfts_of_match[] = {
-	{ .compatible = "st,stmfts", },
+	{ .compatible = "st,stmfts", .data = &stmfts_variant_stmfts },
+	{ .compatible = "st,fts3670", .data = &stmfts_variant_fts3670 },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, stmfts_of_match);
