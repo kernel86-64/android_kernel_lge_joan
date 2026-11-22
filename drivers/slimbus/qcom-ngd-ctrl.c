@@ -62,8 +62,13 @@
 #define SLIMBUS_QMI_SELECT_INSTANCE_REQ_MAX_MSG_LEN	14
 #define SLIMBUS_QMI_SELECT_INSTANCE_RESP_MAX_MSG_LEN	7
 #define SLIMBUS_QMI_CHECK_FRAMER_STAT_RESP_MAX_MSG_LEN	7
-/* QMI response timeout of 500ms */
-#define SLIMBUS_QMI_RESP_TOUT	1000
+/*
+ * QMI response timeout.  The ADSP can take well over a second to answer
+ * while it is still initialising; downstream's msm8998 kernel carries 3 s
+ * here as a board workaround.  With 1 s the select-instance handshake is
+ * lost and WCD934x never probes.
+ */
+#define SLIMBUS_QMI_RESP_TOUT	3000
 
 /* User defined commands */
 #define SLIM_USR_MC_GENERIC_ACK	0x25
