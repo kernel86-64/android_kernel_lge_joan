@@ -860,7 +860,12 @@ static int qcom_pas_probe(struct platform_device *pdev)
 	}
 
 	rproc->has_iommu = of_property_present(pdev->dev.of_node, "iommus");
-	rproc->auto_boot = desc->auto_boot;
+	/*
+	 * Some boards start the ADSP after userspace services are ready.
+	 * Other PAS instances, including the sensor DSP, still boot at probe.
+	 */
+	rproc->auto_boot = desc->auto_boot &&
+			   !of_property_read_bool(pdev->dev.of_node, "qcom,no-auto-boot");
 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
 
 	pas = rproc->priv;
