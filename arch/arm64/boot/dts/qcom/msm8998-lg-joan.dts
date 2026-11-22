@@ -1892,9 +1892,10 @@
 
 &remoteproc_adsp {
 	/*
-	 * joan_rprocs.sh starts the ADSP once the filesystem services and
-	 * Wi-Fi are ready; the SLPI shares the driver and must boot early,
-	 * before the framework reads the sensor list.
+	 * joan_rprocs loads this driver to register the rproc (so pd-mapper can
+	 * read adsp*.jsn), starts the userspace pd-mapper, and only then
+	 * starts the ADSP. Booting at probe would race the locator, so keep it
+	 * offline until userspace asks for it.
 	 */
 	qcom,no-auto-boot;
 	firmware-name = "qcom/msm8998/joan/adsp.mdt";
