@@ -255,6 +255,7 @@ static const struct qcom_pdm_domain_data adsp_audio_pd = {
 	.instance_id = 74,
 	.services = {
 		"avs/audio",
+		"tms/servreg",
 		NULL,
 	},
 };
@@ -274,7 +275,10 @@ static const struct qcom_pdm_domain_data adsp_ois_pd = {
 static const struct qcom_pdm_domain_data adsp_root_pd = {
 	.domain = "msm/adsp/root_pd",
 	.instance_id = 74,
-	.services = { NULL },
+	.services = {
+		"tms/servreg",
+		NULL,
+	},
 };
 
 static const struct qcom_pdm_domain_data adsp_root_pd_pdr = {
@@ -331,19 +335,27 @@ static const struct qcom_pdm_domain_data gpdsp1_root_pd = {
 static const struct qcom_pdm_domain_data slpi_root_pd = {
 	.domain = "msm/slpi/root_pd",
 	.instance_id = 90,
-	.services = { NULL },
+	.services = {
+		"tms/servreg",
+		NULL,
+	},
 };
 
 static const struct qcom_pdm_domain_data slpi_sensor_pd = {
 	.domain = "msm/slpi/sensor_pd",
 	.instance_id = 90,
-	.services = { NULL },
+	.services = {
+		"tms/servreg",
+		NULL,
+	},
 };
 
 static const struct qcom_pdm_domain_data mpss_root_pd = {
 	.domain = "msm/modem/root_pd",
 	.instance_id = 180,
 	.services = {
+		"tms/servreg",
+		"tms/pdr_enabled",
 		NULL,
 	},
 };
@@ -378,6 +390,7 @@ static const struct qcom_pdm_domain_data mpss_wlan_pd = {
 	.instance_id = 180,
 	.services = {
 		"kernel/elf_loader",
+		"tms/servreg",
 		"wlan/fw",
 		NULL,
 	},
