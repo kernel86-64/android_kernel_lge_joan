@@ -5,9 +5,10 @@ SUBLEVEL = 0
 EXTRAVERSION =
 NAME = Baby Opossum Posse
 
-# TODO(b/575473148): temporarily report a fake v7.2-rc9 kernel version
-PATCHLEVEL = 2
-EXTRAVERSION = -rc9
+# joan: the android-mainline-7.3 tag carries the ACK b/575473148
+# workaround that overrides the real 7.3 version with v7.2-rc9.
+# The source is final 7.3 and this is not a GKI build; keep the real
+# VERSION/PATCHLEVEL/SUBLEVEL below.
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
