@@ -1956,6 +1956,8 @@
 	sound {
 		compatible = "qcom,sdm845-sndcard";
 		model = "LG-V30";
+		/* The ES9218P on quaternary MI2S takes 24-bit samples. */
+		qcom,quat-mi2s-s24;
 		status = "okay";
 
 		pinctrl-0 = <&quat_mi2s_default>, <&tert_mi2s_default>;

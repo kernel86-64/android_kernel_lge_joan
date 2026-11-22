@@ -1322,6 +1322,14 @@ config SND_SOC_ES9356
 	select REGMAP_SOUNDWIRE
 	select REGMAP_SOUNDWIRE_MBQ
 
+config SND_SOC_ES9218P
+	tristate "ESS Technology ES9218P headphone DAC"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Enable support for the ESS Technology ES9218P headphone DAC and
+	  amplifier, as used for the "Quad DAC" on the LG V30.
+
 config SND_SOC_FRAMER
 	tristate "Framer codec"
 	depends on GENERIC_FRAMER

@@ -23,6 +23,8 @@
 #define DEFAULT_MCLK_RATE		24576000
 #define TDM_BCLK_RATE		6144000
 #define MI2S_BCLK_RATE		1536000
+/* 48 kHz, two 32-bit slots: S24_LE to a headphone DAC that takes 24 bits */
+#define MI2S_BCLK_RATE_32	3072000
 #define LEFT_SPK_TDM_TX_MASK    0x30
 #define RIGHT_SPK_TDM_TX_MASK   0xC0
 #define SPK_TDM_RX_MASK         0x03
@@ -35,10 +37,14 @@ struct sdm845_snd_data {
 	struct snd_soc_jack jack;
 	bool jack_setup;
 	bool slim_port_setup;
+	bool wcn_port_setup;
 	bool stream_prepared[AFE_PORT_MAX];
+	struct snd_soc_card *card;
 	uint32_t pri_mi2s_clk_count;
 	uint32_t sec_mi2s_clk_count;
 	uint32_t quat_tdm_clk_count;
+	bool quat_mi2s_24bit;
+	struct sdw_stream_runtime *sruntime[AFE_PORT_MAX];
 };
 
 static struct snd_soc_jack_pin sdm845_jack_pins[] = {
@@ -60,11 +66,18 @@ static int sdm845_slim_snd_hw_params(struct snd_pcm_substream *substream,
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct snd_soc_dai *codec_dai;
+	struct sdm845_snd_data *pdata = snd_soc_card_get_drvdata(rtd->card);
 	u32 rx_ch[SLIM_MAX_RX_PORTS], tx_ch[SLIM_MAX_TX_PORTS];
+	struct sdw_stream_runtime *sruntime;
 	u32 rx_ch_cnt = 0, tx_ch_cnt = 0;
 	int ret = 0, i;
 
 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
+		sruntime = snd_soc_dai_get_stream(codec_dai,
+						  substream->stream);
+		if (sruntime != ERR_PTR(-ENOTSUPP))
+			pdata->sruntime[cpu_dai->id] = sruntime;
+
 		ret = snd_soc_dai_get_channel_map(codec_dai,
 				&tx_ch_cnt, tx_ch, &rx_ch_cnt, rx_ch);
 
@@ -209,7 +222,11 @@ static int sdm845_snd_hw_params(struct snd_pcm_substream *substream,
 	case SLIMBUS_0_RX...SLIMBUS_6_TX:
 		ret = sdm845_slim_snd_hw_params(substream, params);
 		break;
+	case SLIMBUS_7_RX...SLIMBUS_8_TX:
+		ret = sdm845_slim_snd_hw_params(substream, params);
+		break;
 	case QUATERNARY_MI2S_RX:
+	case TERTIARY_MI2S_RX:
 	case SECONDARY_MI2S_RX:
 		break;
 	default:
@@ -316,6 +333,34 @@ static int sdm845_dai_init(struct snd_soc_pcm_runtime *rtd)
 		pdata->slim_port_setup = true;
 
 		break;
+	case SLIMBUS_7_RX...SLIMBUS_8_TX:
+	{
+		/*
+		 * WCN399x BT/FM slave channel allocation, from the
+		 * downstream msm8998 machine driver (msm_wcn_init):
+		 * the ADSP serves the FM TX group on channels 159/160
+		 * and SCO audio on 161 (TX) and 157/158 (RX).
+		 */
+		unsigned int wcn_rx_ch[2] = {157, 158};
+		unsigned int wcn_tx_ch[3] = {159, 160, 161};
+
+		if (pdata->wcn_port_setup || !link->no_pcm)
+			return 0;
+
+		for_each_rtd_codec_dais(rtd, i, codec_dai) {
+			rval = snd_soc_dai_set_channel_map(codec_dai,
+							  ARRAY_SIZE(wcn_tx_ch),
+							  wcn_tx_ch,
+							  ARRAY_SIZE(wcn_rx_ch),
+							  wcn_rx_ch);
+			if (rval != 0 && rval != -ENOTSUPP)
+				return rval;
+		}
+
+		pdata->wcn_port_setup = true;
+
+		break;
+	}
 	default:
 		break;
 	}
@@ -364,12 +409,33 @@ static int sdm845_snd_startup(struct snd_pcm_substream *substream)
 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
 		break;
 	case QUATERNARY_MI2S_RX:
-		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
 		snd_soc_dai_set_sysclk(cpu_dai,
 			Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT,
-			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
+			data->quat_mi2s_24bit ? MI2S_BCLK_RATE_32 : MI2S_BCLK_RATE,
+			SNDRV_PCM_STREAM_PLAYBACK);
 		snd_soc_dai_set_fmt(cpu_dai, fmt);
-		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
+		break;
+
+	case TERTIARY_MI2S_RX:
+		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
+		ret = snd_soc_dai_set_sysclk(cpu_dai,
+			Q6AFE_LPASS_CLK_ID_TER_MI2S_IBIT,
+			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
+		if (ret)
+			dev_err(card->dev,
+				"tert MI2S set_sysclk %u Hz failed: %d\n",
+				MI2S_BCLK_RATE, ret);
+		ret = snd_soc_dai_set_fmt(cpu_dai, fmt);
+		/* -ENOTSUPP: the DAI driver has no set_fmt op, i.e. there
+		 * is nothing to configure -- not a format failure. */
+		if (ret && ret != -ENOTSUPP)
+			dev_err(card->dev, "tert MI2S cpu set_fmt failed: %d\n",
+				ret);
+		ret = snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
+		if (ret && ret != -ENOTSUPP)
+			dev_err(card->dev, "tert MI2S codec set_fmt failed: %d\n",
+				ret);
+		ret = 0;
 		break;
 
 	case QUATERNARY_TDM_RX_0:
@@ -423,6 +489,7 @@ static void  sdm845_snd_shutdown(struct snd_pcm_substream *substream)
 	struct snd_soc_card *card = rtd->card;
 	struct sdm845_snd_data *data = snd_soc_card_get_drvdata(card);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct sdw_stream_runtime *sruntime = data->sruntime[cpu_dai->id];
 
 	switch (cpu_dai->id) {
 	case PRIMARY_MI2S_RX:
@@ -456,6 +523,7 @@ static void  sdm845_snd_shutdown(struct snd_pcm_substream *substream)
 		break;
 	case SLIMBUS_0_RX...SLIMBUS_6_TX:
 	case QUATERNARY_MI2S_RX:
+	case TERTIARY_MI2S_RX:
 		break;
 
 	default:
@@ -463,7 +531,8 @@ static void  sdm845_snd_shutdown(struct snd_pcm_substream *substream)
 		break;
 	}
 
-	qcom_snd_sdw_shutdown(substream);
+	data->sruntime[cpu_dai->id] = NULL;
+	sdw_release_stream(sruntime);
 }
 
 static int sdm845_snd_prepare(struct snd_pcm_substream *substream)
@@ -471,8 +540,38 @@ static int sdm845_snd_prepare(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct sdm845_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct sdw_stream_runtime *sruntime = data->sruntime[cpu_dai->id];
+	int ret;
 
-	return qcom_snd_sdw_prepare(substream, &data->stream_prepared[cpu_dai->id]);
+	if (!sruntime)
+		return 0;
+
+	if (data->stream_prepared[cpu_dai->id]) {
+		sdw_disable_stream(sruntime);
+		sdw_deprepare_stream(sruntime);
+		data->stream_prepared[cpu_dai->id] = false;
+	}
+
+	ret = sdw_prepare_stream(sruntime);
+	if (ret)
+		return ret;
+
+	/**
+	 * NOTE: there is a strict hw requirement about the ordering of port
+	 * enables and actual WSA881x PA enable. PA enable should only happen
+	 * after soundwire ports are enabled if not DC on the line is
+	 * accumulated resulting in Click/Pop Noise
+	 * PA enable/mute are handled as part of codec DAPM and digital mute.
+	 */
+
+	ret = sdw_enable_stream(sruntime);
+	if (ret) {
+		sdw_deprepare_stream(sruntime);
+		return ret;
+	}
+	data->stream_prepared[cpu_dai->id] = true;
+
+	return ret;
 }
 
 static int sdm845_snd_hw_free(struct snd_pcm_substream *substream)
@@ -480,8 +579,15 @@ static int sdm845_snd_hw_free(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct sdm845_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct sdw_stream_runtime *sruntime = data->sruntime[cpu_dai->id];
 
-	return qcom_snd_sdw_hw_free(substream, &data->stream_prepared[cpu_dai->id]);
+	if (sruntime && data->stream_prepared[cpu_dai->id]) {
+		sdw_disable_stream(sruntime);
+		sdw_deprepare_stream(sruntime);
+		data->stream_prepared[cpu_dai->id] = false;
+	}
+
+	return 0;
 }
 
 static const struct snd_soc_ops sdm845_be_ops = {
@@ -501,9 +607,22 @@ static int sdm845_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 					SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
 
+	struct sdm845_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+
 	rate->min = rate->max = DEFAULT_SAMPLE_RATE_48K;
 	channels->min = channels->max = 2;
-	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
+
+	/*
+	 * Software volume attenuates the mixed stream, so a 16-bit link to a
+	 * DAC loses a bit of resolution per 6 dB turned down. Feed a DAC that
+	 * takes 24 bits (the LG V30's ES9218P on quaternary MI2S) S24_LE.
+	 */
+	if (cpu_dai->id == QUATERNARY_MI2S_RX && data->quat_mi2s_24bit) {
+		snd_mask_none(fmt);
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE);
+	} else
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
 
 	return 0;
 }
@@ -563,6 +682,9 @@ static int sdm845_snd_platform_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	data->card = card;
+	/* The quaternary MI2S codec takes 24-bit samples (LG V30's ES9218P). */
+	data->quat_mi2s_24bit = of_property_read_bool(dev->of_node, "qcom,quat-mi2s-s24");
 	snd_soc_card_set_drvdata(card, data);
 
 	sdm845_add_ops(card);
