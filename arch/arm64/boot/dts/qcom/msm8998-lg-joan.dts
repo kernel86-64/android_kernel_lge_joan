@@ -599,12 +599,12 @@
 &pmi8998_vbus {
 	regulator-min-microamp = <1250000>;
 	regulator-max-microamp = <1250000>;
-	status = "okay";
+	status = "disabled";
 };
 
 &pmi8998_typec {
 	vdd-pdphy-supply = <&vreg_l24a_3p075>;
-	status = "okay";
+	status = "disabled";
 
 	connector {
 		compatible = "usb-c-connector";
@@ -1209,23 +1209,12 @@
 
 &usb3_dwc3 {
 	/*
-	 * The data role comes from the PMI8998 Type-C port.  Whenever no role
-	 * is set -- nothing attached, or the port driver not loaded -- dwc3
-	 * stays a gadget, so the RAM-boot USB console does not depend on it.
-	 *
-	 * SuperSpeed does make USB depend on the QMP PHY driver, though:
-	 * dwc3 waits for its usb3-phy, so that driver (phy-qcom-qmp-usbc,
-	 * built by CONFIG_PHY_QCOM_QMP_COMBO) has to be built in, or be in
-	 * the initramfs, for USB to come up in a RAM boot.
-	 *
-	 * The cell selects the USB3 half. A missing cell would also do that,
-	 * but the raised #phy-cells makes dtc warn and is the change that
-	 * previously broke USB on boards that were not updated.
+	 * Recovery uses the base 7.3 USB3-only QMP PHY and a fixed peripheral
+	 * role. The donor's USB3+DP combo path and the PMI8998 Type-C role
+	 * switch are enabled separately for the Android port.
 	 */
-	phys = <&qusb2phy>, <&usb3phy QMP_USB43DP_USB3_PHY>;
-	dr_mode = "otg";
-	usb-role-switch;
-	role-switch-default-mode = "peripheral";
+	phys = <&qusb2phy>, <&usb3phy>;
+	dr_mode = "peripheral";
 };
 
 &usb3_dwc3_hs {
@@ -1233,27 +1222,8 @@
 };
 
 &usb3phy {
-	compatible = "qcom,msm8998-qmp-usb3-dp-phy";
-	reg = <0x0c010000 0x2000>;
-	#clock-cells = <1>;
-	#phy-cells = <1>;
-
-	resets = <&gcc GCC_USB3_PHY_BCR>,
-		 <&gcc GCC_USB3PHY_PHY_BCR>,
-		 <&gcc GCC_USB3_DP_PHY_BCR>;
-	reset-names = "phy", "phy_phy", "dp_phy";
-
-	/*
-	 * 0xb244 is the VLS clamp. 0xb248 selects the PHY mode and must
-	 * change while the resets above are asserted.
-	 */
-	qcom,tcsr-reg = <&tcsr_regs_2 0xb244 0xb248>;
-
 	vdda-phy-supply = <&vreg_l1a_0p875>;
 	vdda-pll-supply = <&vreg_l2a_1p2>;
-
-	mode-switch;
-	orientation-switch;
 
 	status = "okay";
 };
@@ -1270,42 +1240,15 @@
 		 <&mdss_dsi1_phy DSI_PIXEL_PLL_CLK>,
 		 <&mdss_dsi1_phy DSI_BYTE_PLL_CLK>,
 		 <&mdss_hdmi_phy>,
-		 <&usb3phy QMP_USB43DP_DP_LINK_CLK>,
-		 <&usb3phy QMP_USB43DP_DP_VCO_DIV_CLK>,
+		 <0>,
+		 <0>,
 		 <&gcc GCC_MMSS_GPLL0_DIV_CLK>;
 };
 
-&mdss_dp {
-	status = "okay";
-	phys = <&usb3phy QMP_USB43DP_DP_PHY>;
-	phy-names = "dp";
-
-	assigned-clocks = <&mmcc DP_LINK_CLK_SRC>,
-			  <&mmcc DP_PIXEL_CLK_SRC>;
-	assigned-clock-parents = <&usb3phy QMP_USB43DP_DP_LINK_CLK>,
-				 <&usb3phy QMP_USB43DP_DP_VCO_DIV_CLK>;
-
-	ports {
-		port@1 {
-			mdss_dp_out: endpoint {
-				data-lanes = <2 3 1 0>;
-				remote-endpoint = <&usb3phy_dp_in>;
-			};
-		};
-	};
-};
-
-&usb3phy {
-	ports {
-		port@2 {
-			reg = <2>;
-
-			usb3phy_dp_in: endpoint {
-				remote-endpoint = <&mdss_dp_out>;
-			};
-		};
-	};
-};
+/*
+ * DisplayPort alt mode stays off until the donor USB3+DP combo PHY is
+ * ported; the recovery image uses the base 7.3 USB3-only PHY.
+ */
 
 &wifi {
 	vdd-0.8-cx-mx-supply = <&vreg_l5a_0p8>;
@@ -1682,7 +1625,7 @@
  * early-probe images used here).
  */
 &adreno_gpu {
-	status = "okay";
+	status = "disabled";
 
 	vdd-supply = <&pm8005_s1>;
 
