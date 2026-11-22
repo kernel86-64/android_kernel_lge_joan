@@ -88,7 +88,7 @@ int ipa_mem_setup(struct ipa *ipa)
 	/* Get a transaction to define the header memory region and to zero
 	 * the processing context and modem memory regions.
 	 */
-	trans = ipa_cmd_trans_alloc(ipa, 4);
+	trans = ipa_cmd_trans_alloc(ipa, ipa->version == IPA_VERSION_3_1 ? 5 : 4);
 	if (!trans) {
 		dev_err(ipa->dev, "no transaction for memory setup\n");
 		return -EBUSY;
@@ -106,6 +106,10 @@ int ipa_mem_setup(struct ipa *ipa)
 		size += mem->size;
 
 	ipa_cmd_hdr_init_local_add(trans, offset, size, addr);
+
+	/* IPA v3.1 uses the system header table for the default route. */
+	if (ipa->version == IPA_VERSION_3_1)
+		ipa_cmd_hdr_init_system_add(trans, addr);
 
 	ipa_mem_zero_region_add(trans, IPA_MEM_MODEM_PROC_CTX);
 	ipa_mem_zero_region_add(trans, IPA_MEM_AP_PROC_CTX);
