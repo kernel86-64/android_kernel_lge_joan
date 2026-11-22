@@ -6,6 +6,7 @@
 #include <linux/types.h>
 #include <linux/cpumask.h>
 #include <linux/firmware/qcom/qcom_pas.h>
+#include <linux/moduleparam.h>
 #include <linux/pm_opp.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/slab.h>
@@ -15,6 +16,23 @@
 
 extern bool hang_debug;
 static void a5xx_dump(struct msm_gpu *gpu);
+
+/*
+ * A5xx preemption and per-process pagetables are mutually exclusive here.
+ *
+ * a5xx_preempt_hw_init() programs CP_CONTEXT_SWITCH_SMMU_INFO = 0, i.e. "we
+ * aren't switching pagetables".  msm8998 cannot use TTBR1, so a private VM
+ * emits a CP_SMMU_TABLE_UPDATE on submit.  A ring restored by preemption
+ * resumes mid-ring without replaying that packet and the preemption record
+ * carries no SMMU information, so it runs against whichever TTBR0 the ring
+ * it preempted away from left installed.  That produces GPU translation
+ * faults and corrupted composition.  Keep preemption off by default until
+ * the preemption record can carry the SMMU state.
+ */
+static bool a5xx_enable_preemption;
+MODULE_PARM_DESC(a5xx_enable_preemption,
+		 "Enable preemption (A5XX only; broken while per-process pagetables are on)");
+module_param(a5xx_enable_preemption, bool, 0600);
 
 #define GPU_PAS_ID 13
 
@@ -1747,6 +1765,9 @@ static struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
 	nr_rings = 4;
 
 	if (config->info->revn == 510)
+		nr_rings = 1;
+
+	if (!a5xx_enable_preemption)
 		nr_rings = 1;
 
 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, config->info->funcs, nr_rings);
