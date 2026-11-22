@@ -61,6 +61,7 @@ struct qcom_icc_provider {
 	u16 ab_coeff;
 	u16 ib_coeff;
 	u32 bus_clk_rate[QCOM_SMD_RPM_STATE_NUM];
+	u32 bus_clk_max_rate;
 	const struct rpm_clk_resource *bus_clk_desc;
 	struct clk *bus_clk;
 	bool keep_alive;
@@ -133,6 +134,12 @@ struct qcom_icc_desc {
 	size_t num_intf_clocks;
 	bool keep_alive;
 	enum qcom_icc_type type;
+	/*
+	 * Highest bus clock (kHz) to request from the RPM, 0 for no limit:
+	 * keeps an unstable top step out of reach, including the INT_MAX
+	 * initial vote held until sync_state().
+	 */
+	u32 bus_clk_max_rate;
 	const struct regmap_config *regmap_cfg;
 	unsigned int qos_offset;
 	u16 ab_coeff;
@@ -167,7 +174,7 @@ int qnoc_probe(struct platform_device *pdev);
 void qnoc_remove(struct platform_device *pdev);
 
 bool qcom_icc_rpm_smd_available(void);
-int qcom_icc_rpm_smd_send(int ctx, int rsc_type, int id, u32 val);
+int qcom_icc_rpm_smd_send(int ctx, int rsc_type, int id, u64 val);
 int qcom_icc_rpm_set_bus_rate(const struct rpm_clk_resource *clk, int ctx, u32 rate);
 
 #endif
