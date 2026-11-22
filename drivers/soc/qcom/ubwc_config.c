@@ -195,6 +195,16 @@ const struct qcom_ubwc_cfg_data *qcom_ubwc_config_get_data(void)
 		return ERR_PTR(-EINVAL);
 	}
 
+	/*
+	 * joan's SMEM DRAM table does not describe the real highest bank bit
+	 * for this board.  Using it makes both the GPU and DPU decode UBWC
+	 * buffers with the wrong stride, which shows up as a repeating pattern
+	 * on the panel.  The msm8998 table entry (UBWC 1.0, HBB 15) is the
+	 * value the 6.18 tree and downstream use.
+	 */
+	if (of_machine_is_compatible("qcom,msm8998"))
+		return data;
+
 	hbb = qcom_smem_dram_get_hbb();
 	if (hbb == -ENODATA) {
 		/* Lack of HBB data is OK - it was only introduced later */
