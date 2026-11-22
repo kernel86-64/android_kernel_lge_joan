@@ -717,6 +717,18 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 	u32 hbb;
 	int ret;
 
+	/*
+	 * A runtime suspend and resume pair can be short enough that the GX
+	 * rail does not discharge.  The GPU then keeps its old CP state across
+	 * what the driver believes was a power collapse: CP_RB_CNTL still
+	 * describes the old ring and the ME is not halted.  Do not assume the
+	 * hardware came back reset; put it through the same software reset
+	 * a5xx_recover() uses before programming anything else.
+	 */
+	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 1);
+	gpu_read(gpu, REG_A5XX_RBBM_SW_RESET_CMD);
+	gpu_write(gpu, REG_A5XX_RBBM_SW_RESET_CMD, 0);
+
 	gpu_write(gpu, REG_A5XX_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003);
 
 	if (adreno_is_a509(adreno_gpu) || adreno_is_a512(adreno_gpu) ||
@@ -753,9 +765,14 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 			0xFFFFFFFF);
 	}
 
-	/* Enable fault detection */
+	/*
+	 * Enable fault detection.  The threshold is in units of 16 GPU
+	 * cycles.  0xFFFF is about 1.5 ms at the A540's top frequency, short
+	 * enough for a long but healthy draw to trip it.  Use downstream's
+	 * four-million-cycle value for every A5xx past A530v1.
+	 */
 	gpu_write(gpu, REG_A5XX_RBBM_INTERFACE_HANG_INT_CNTL,
-		(1 << 30) | 0xFFFF);
+		(1 << 30) | 0x3FFFF);
 
 	/* Turn on performance counters */
 	gpu_write(gpu, REG_A5XX_RBBM_PERFCTR_CNTL, 0x01);
