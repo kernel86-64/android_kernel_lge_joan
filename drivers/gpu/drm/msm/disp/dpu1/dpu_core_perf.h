@@ -57,8 +57,10 @@ struct dpu_core_perf {
 u64 dpu_core_perf_adjusted_mode_clk(u64 clk_rate,
 				    const struct dpu_perf_cfg *perf_cfg);
 
-int dpu_core_perf_crtc_check(struct drm_crtc *crtc,
-		struct drm_crtc_state *state);
+struct msm_kms;
+
+void dpu_core_perf_crtc_calc(struct drm_crtc_state *state);
+int dpu_core_perf_check(struct msm_kms *kms, struct drm_atomic_commit *state);
 
 int dpu_core_perf_crtc_update(struct drm_crtc *crtc,
 			      int params_changed);

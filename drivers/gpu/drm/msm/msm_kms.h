@@ -69,6 +69,12 @@ struct msm_kms_funcs {
 	int (*check_mode_changed)(struct msm_kms *kms, struct drm_atomic_commit *state);
 
 	/**
+	 * @check_perf: Validate performance requirements after the atomic
+	 * helpers have checked the proposed plane and CRTC states.
+	 */
+	int (*check_perf)(struct msm_kms *kms, struct drm_atomic_commit *state);
+
+	/**
 	 * Prepare for atomic commit.  This is called after any previous
 	 * (async or otherwise) commit has completed.
 	 */

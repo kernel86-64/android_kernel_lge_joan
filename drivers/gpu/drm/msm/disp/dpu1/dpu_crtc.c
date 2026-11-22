@@ -1598,12 +1598,7 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 
 	atomic_inc(&_dpu_crtc_get_kms(crtc)->bandwidth_ref);
 
-	rc = dpu_core_perf_crtc_check(crtc, crtc_state);
-	if (rc) {
-		DPU_ERROR("crtc%d failed performance check %d\n",
-				crtc->base.id, rc);
-		return rc;
-	}
+	dpu_core_perf_crtc_calc(crtc_state);
 
 	return 0;
 }

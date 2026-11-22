@@ -1087,6 +1087,7 @@ static const struct msm_kms_funcs kms_funcs = {
 	.enable_commit   = dpu_kms_enable_commit,
 	.disable_commit  = dpu_kms_disable_commit,
 	.check_mode_changed = dpu_kms_check_mode_changed,
+	.check_perf      = dpu_core_perf_check,
 	.flush_commit    = dpu_kms_flush_commit,
 	.acquire_link    = dpu_kms_acquire_link,
 	.release_link    = dpu_kms_release_link,

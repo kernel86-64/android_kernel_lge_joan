@@ -24,8 +24,6 @@
  * @multirect_index: index of the rectangle of SSPP
  * @multirect_mode: parallel or time multiplex multirect mode
  * @pending:	whether the current update is still pending
- * @plane_fetch_bw: calculated BW per plane
- * @plane_clk: calculated clk per plane
  * @needs_dirtyfb: whether attached CRTC needs pixel data explicitly flushed
  * @layout:     framebuffer memory layout
  */
@@ -37,9 +35,6 @@ struct dpu_plane_state {
 	bool needs_qos_remap;
 	bool pending;
 
-	u64 plane_fetch_bw;
-	u64 plane_clk;
-
 	bool needs_dirtyfb;
 
 	struct dpu_hw_fmt_layout layout;
@@ -47,6 +42,9 @@ struct dpu_plane_state {
 
 #define to_dpu_plane_state(x) \
 	container_of(x, struct dpu_plane_state, base)
+
+void dpu_plane_calc_perf(const struct drm_plane_state *state,
+			 const struct drm_display_mode *mode, u64 *bw, u64 *clk);
 
 void dpu_plane_flush(struct drm_plane *plane);
 

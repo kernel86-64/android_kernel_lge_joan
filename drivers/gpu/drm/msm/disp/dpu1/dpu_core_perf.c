@@ -51,94 +51,38 @@ u64 dpu_core_perf_adjusted_mode_clk(u64 mode_clk_rate,
 	return mode_clk_rate;
 }
 
-/**
- * _dpu_core_perf_calc_bw() - to calculate BW per crtc
- * @perf_cfg: performance configuration
- * @crtc: pointer to a crtc
- * Return: returns aggregated BW for all planes in crtc.
- */
-static u64 _dpu_core_perf_calc_bw(const struct dpu_perf_cfg *perf_cfg,
-		struct drm_crtc *crtc)
-{
-	struct drm_plane *plane;
-	struct dpu_plane_state *pstate;
-	u64 crtc_plane_bw = 0;
-	u32 bw_factor;
-
-	drm_atomic_crtc_for_each_plane(plane, crtc) {
-		pstate = to_dpu_plane_state(plane->state);
-		if (!pstate)
-			continue;
-
-		crtc_plane_bw += pstate->plane_fetch_bw;
-	}
-
-	bw_factor = perf_cfg->bw_inefficiency_factor;
-	if (bw_factor) {
-		crtc_plane_bw *= bw_factor;
-		do_div(crtc_plane_bw, 100);
-	}
-
-	return crtc_plane_bw;
-}
-
-/**
- * _dpu_core_perf_calc_clk() - to calculate clock per crtc
- * @perf_cfg: performance configuration
- * @crtc: pointer to a crtc
- * @state: pointer to a crtc state
- * Return: returns max clk for all planes in crtc.
- */
-static u64 _dpu_core_perf_calc_clk(const struct dpu_perf_cfg *perf_cfg,
-		struct drm_crtc *crtc, struct drm_crtc_state *state)
-{
-	struct drm_plane *plane;
-	struct dpu_plane_state *pstate;
-	struct drm_display_mode *mode;
-	u64 mode_clk;
-
-	mode = &state->adjusted_mode;
-
-	mode_clk = (u64)mode->vtotal * mode->hdisplay * drm_mode_vrefresh(mode);
-
-	drm_atomic_crtc_for_each_plane(plane, crtc) {
-		pstate = to_dpu_plane_state(plane->state);
-		if (!pstate)
-			continue;
-
-		mode_clk = max(pstate->plane_clk, mode_clk);
-	}
-
-	return dpu_core_perf_adjusted_mode_clk(mode_clk, perf_cfg);
-}
-
 static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
 {
-	struct msm_drm_private *priv;
-	priv = crtc->dev->dev_private;
+	struct msm_drm_private *priv = crtc->dev->dev_private;
+
 	return to_dpu_kms(priv->kms);
 }
 
-static void _dpu_core_perf_calc_crtc(const struct dpu_core_perf *core_perf,
-				     struct drm_crtc *crtc,
-				     struct drm_crtc_state *state,
-				     struct dpu_core_perf_params *perf)
+void dpu_core_perf_crtc_calc(struct drm_crtc_state *state)
 {
-	const struct dpu_perf_cfg *perf_cfg = core_perf->perf_cfg;
+	struct dpu_kms *kms = _dpu_crtc_get_kms(state->crtc);
+	const struct dpu_perf_cfg *cfg = kms->perf.perf_cfg;
+	struct dpu_core_perf_params *perf = &to_dpu_crtc_state(state)->new_perf;
+	const struct drm_display_mode *mode = &state->adjusted_mode;
+	const struct drm_plane_state *plane_state;
+	struct drm_plane *plane;
+	u64 bw = 0;
+	u64 clk = (u64)mode->vtotal * mode->hdisplay * drm_mode_vrefresh(mode);
 
-	if (!perf_cfg || !crtc || !state || !perf) {
-		DPU_ERROR("invalid parameters\n");
-		return;
+	drm_atomic_crtc_state_for_each_plane_state(plane, plane_state, state) {
+		if (plane_state->visible)
+			dpu_plane_calc_perf(plane_state, mode, &bw, &clk);
 	}
 
-	perf->bw_ctl = _dpu_core_perf_calc_bw(perf_cfg, crtc);
-	perf->max_per_pipe_ib = perf_cfg->min_dram_ib;
-	perf->core_clk_rate = _dpu_core_perf_calc_clk(perf_cfg, crtc, state);
-	DRM_DEBUG_ATOMIC(
-		"crtc=%d clk_rate=%llu core_ib=%u core_ab=%u\n",
-			crtc->base.id, perf->core_clk_rate,
-			perf->max_per_pipe_ib,
-			(u32)DIV_ROUND_UP_ULL(perf->bw_ctl, 1000));
+	if (cfg->bw_inefficiency_factor)
+		bw = div_u64(bw * cfg->bw_inefficiency_factor, 100);
+
+	perf->bw_ctl = bw;
+	perf->max_per_pipe_ib = cfg->min_dram_ib;
+	perf->core_clk_rate = dpu_core_perf_adjusted_mode_clk(clk, cfg);
+	DRM_DEBUG_ATOMIC("crtc=%d clk_rate=%llu core_ib=%u core_ab=%llu\n",
+			 state->crtc->base.id, perf->core_clk_rate,
+			 perf->max_per_pipe_ib, DIV_ROUND_UP_ULL(bw, 1000));
 }
 
 static void dpu_core_perf_aggregate(struct drm_device *ddev,
@@ -165,52 +109,49 @@ static void dpu_core_perf_aggregate(struct drm_device *ddev,
 	}
 }
 
-/**
- * dpu_core_perf_crtc_check - validate performance of the given crtc state
- * @crtc: Pointer to crtc
- * @state: Pointer to new crtc state
- * return: zero if success, or error code otherwise
- */
-int dpu_core_perf_crtc_check(struct drm_crtc *crtc,
-		struct drm_crtc_state *state)
+int dpu_core_perf_check(struct msm_kms *msm_kms, struct drm_atomic_commit *state)
 {
-	u32 bw, threshold;
-	struct dpu_crtc_state *dpu_cstate;
-	struct dpu_kms *kms;
-	struct dpu_core_perf_params perf = { 0 };
+	struct dpu_kms *kms = to_dpu_kms(msm_kms);
+	u32 threshold = kms->perf.perf_cfg->max_bw_high;
+	struct drm_crtc_state *crtc_state;
+	struct drm_crtc *crtc;
+	u64 bw = 0;
+	int i, ret;
 
-	if (!crtc || !state) {
-		DPU_ERROR("invalid crtc\n");
-		return -EINVAL;
+	/* Let a disable-only transaction release bandwidth unconditionally. */
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (drm_atomic_crtc_effectively_active(crtc_state))
+			break;
 	}
-
-	kms = _dpu_crtc_get_kms(crtc);
-
-	/* we only need bandwidth check on real-time clients (interfaces) */
-	if (dpu_crtc_get_client_type(crtc) == NRT_CLIENT)
+	if (i == state->dev->mode_config.num_crtc)
 		return 0;
 
-	dpu_cstate = to_dpu_crtc_state(state);
+	/*
+	 * Plane and CRTC checks have computed new_perf for the affected
+	 * CRTCs. Lock the others so concurrent commits cannot both consume
+	 * the same remaining bandwidth.
+	 */
+	drm_for_each_crtc(crtc, state->dev) {
+		ret = drm_modeset_lock(&crtc->mutex, state->acquire_ctx);
+		if (ret)
+			return ret;
 
-	/* obtain new values */
-	_dpu_core_perf_calc_crtc(&kms->perf, crtc, state, &dpu_cstate->new_perf);
+		crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+		if (!crtc_state)
+			crtc_state = crtc->state;
 
-	dpu_core_perf_aggregate(crtc->dev, dpu_crtc_get_client_type(crtc), &perf);
+		if (drm_atomic_crtc_effectively_active(crtc_state))
+			bw += to_dpu_crtc_state(crtc_state)->new_perf.bw_ctl;
+	}
 
-	/* convert bandwidth to kb */
-	bw = DIV_ROUND_UP_ULL(perf.bw_ctl, 1000);
-	DRM_DEBUG_ATOMIC("calculated bandwidth=%uk\n", bw);
-
-	threshold = kms->perf.perf_cfg->max_bw_high;
-
-	DRM_DEBUG_ATOMIC("final threshold bw limit = %d\n", threshold);
-
+	bw = DIV_ROUND_UP_ULL(bw, 1000);
 	if (!threshold) {
 		DPU_ERROR("no bandwidth limits specified\n");
 		return -E2BIG;
-	} else if (bw > threshold) {
-		DPU_ERROR("exceeds bandwidth: %ukb > %ukb\n", bw,
-				threshold);
+	}
+	if (bw > threshold) {
+		DRM_DEBUG_ATOMIC("exceeds bandwidth: %llu kB/s > %u kB/s\n",
+				 bw, threshold);
 		return -E2BIG;
 	}
 

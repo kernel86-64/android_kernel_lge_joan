@@ -116,7 +116,7 @@ static struct dpu_kms *_dpu_plane_get_kms(struct drm_plane *plane)
 static u64 _dpu_plane_calc_bw(const struct dpu_mdss_cfg *catalog,
 	const struct msm_format *fmt,
 	const struct drm_display_mode *mode,
-	struct dpu_sw_pipe_cfg *pipe_cfg)
+	const struct dpu_sw_pipe_cfg *pipe_cfg)
 {
 	int src_width, src_height, dst_height, fps;
 	u64 plane_pixel_rate, plane_bit_rate;
@@ -159,11 +159,11 @@ static u64 _dpu_plane_calc_bw(const struct dpu_mdss_cfg *catalog,
  * _dpu_plane_calc_clk - calculate clock required for a plane
  * @mode: Pointer to drm display mode
  * @pipe_cfg: Pointer to pipe configuration
- * Result: Updates calculated clock in the plane state.
+ * Return: required clock rate.
  * Clock equation: dst_w * v_total * fps * (src_h / dst_h)
  */
 static u64 _dpu_plane_calc_clk(const struct drm_display_mode *mode,
-		struct dpu_sw_pipe_cfg *pipe_cfg)
+		const struct dpu_sw_pipe_cfg *pipe_cfg)
 {
 	int dst_width, src_height, dst_height, fps;
 	u64 plane_clk;
@@ -1570,18 +1570,24 @@ static void dpu_plane_sspp_atomic_update(struct drm_plane *plane,
 
 	if (pstate->needs_qos_remap)
 		pstate->needs_qos_remap = false;
+}
 
-	pstate->plane_fetch_bw = 0;
-	pstate->plane_clk = 0;
+void dpu_plane_calc_perf(const struct drm_plane_state *state,
+			 const struct drm_display_mode *mode, u64 *bw, u64 *clk)
+{
+	const struct dpu_plane_state *pstate = to_dpu_plane_state(state);
+	const struct msm_format *fmt = msm_framebuffer_format(state->fb);
+	const struct dpu_plane *pdpu = to_dpu_plane(state->plane);
+	const struct dpu_sw_pipe_cfg *cfg;
+	int i;
+
 	for (i = 0; i < PIPES_PER_PLANE; i++) {
-		if (!drm_rect_width(&pstate->pipe_cfg[i].src_rect))
+		cfg = &pstate->pipe_cfg[i];
+		if (!drm_rect_width(&cfg->src_rect))
 			continue;
-		pstate->plane_fetch_bw += _dpu_plane_calc_bw(pdpu->catalog, fmt,
-							     &crtc->mode, &pstate->pipe_cfg[i]);
 
-		pstate->plane_clk = max(pstate->plane_clk,
-					_dpu_plane_calc_clk(&crtc->mode,
-							    &pstate->pipe_cfg[i]));
+		*bw += _dpu_plane_calc_bw(pdpu->catalog, fmt, mode, cfg);
+		*clk = max(*clk, _dpu_plane_calc_clk(mode, cfg));
 	}
 }
 

@@ -207,7 +207,14 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
 	if (ret)
 		return ret;
 
-	return drm_atomic_helper_check(dev, state);
+	ret = drm_atomic_helper_check(dev, state);
+	if (ret)
+		return ret;
+
+	if (kms && kms->funcs && kms->funcs->check_perf)
+		return kms->funcs->check_perf(kms, state);
+
+	return 0;
 }
 
 void msm_atomic_commit_tail(struct drm_atomic_commit *state)
