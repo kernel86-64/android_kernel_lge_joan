@@ -329,6 +329,15 @@ static int server_del(struct qrtr_node *node, unsigned int port, bool bcast)
 
 static int ctrl_cmd_hello(struct sockaddr_qrtr *sq)
 {
+	int ret;
+
+	/* A peer can send HELLO before our endpoint's delayed work runs. */
+	if (sq->sq_node != qrtr_ns.local_node) {
+		ret = qrtr_ensure_hello(sq->sq_node);
+		if (ret)
+			return ret;
+	}
+
 	return announce_servers(sq);
 }
 

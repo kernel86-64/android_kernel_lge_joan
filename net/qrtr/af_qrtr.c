@@ -591,14 +591,48 @@ static struct sk_buff *qrtr_alloc_ctrl_packet(struct qrtr_ctrl_pkt **pkt,
 	return skb;
 }
 
-static void qrtr_hello_work(struct work_struct *work)
+static int qrtr_send_hello(struct qrtr_node *node)
 {
 	struct sockaddr_qrtr from = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
 	struct sockaddr_qrtr to = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
 	struct qrtr_ctrl_pkt *pkt;
+	struct sk_buff *skb;
+
+	skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+
+	pkt->cmd = cpu_to_le32(QRTR_TYPE_HELLO);
+	from.sq_node = qrtr_local_nid;
+	to.sq_node = READ_ONCE(node->nid);
+	return qrtr_node_enqueue(node, skb, QRTR_TYPE_HELLO, &from, &to);
+}
+
+int qrtr_ensure_hello(unsigned int nid)
+{
+	struct qrtr_node *node;
+	bool sent;
+	int ret = 0;
+
+	node = qrtr_node_lookup(nid);
+	if (!node)
+		return -ENODEV;
+
+	mutex_lock(&node->ep_lock);
+	sent = node->hello_sent;
+	mutex_unlock(&node->ep_lock);
+
+	if (!sent)
+		ret = qrtr_send_hello(node);
+
+	qrtr_node_release(node);
+	return ret;
+}
+
+static void qrtr_hello_work(struct work_struct *work)
+{
 	struct qrtr_node *node;
 	struct qrtr_sock *ctrl;
-	struct sk_buff *skb;
 
 	node = container_of(to_delayed_work(work), struct qrtr_node, say_hello);
 
@@ -609,17 +643,8 @@ static void qrtr_hello_work(struct work_struct *work)
 		return;
 	}
 
-	skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
-	if (!skb) {
-		qrtr_port_put(ctrl);
+	if (qrtr_send_hello(node) == -ENOMEM)
 		schedule_delayed_work(&node->say_hello, msecs_to_jiffies(100));
-		return;
-	}
-
-	pkt->cmd = cpu_to_le32(QRTR_TYPE_HELLO);
-	from.sq_node = qrtr_local_nid;
-	to.sq_node = node->nid;
-	qrtr_node_enqueue(node, skb, QRTR_TYPE_HELLO, &from, &to);
 	qrtr_port_put(ctrl);
 }
 
