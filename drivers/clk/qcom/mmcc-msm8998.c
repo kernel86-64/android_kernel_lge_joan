@@ -698,43 +698,30 @@ static struct clk_rcg2 dp_crypto_clk_src = {
 	},
 };
 
-static const struct freq_tbl ftbl_dp_link_clk_src[] = {
-	F(162000, P_DPLINK, 2, 0, 0),
-	F(270000, P_DPLINK, 2, 0, 0),
-	F(540000, P_DPLINK, 2, 0, 0),
-	{ }
-};
-
 static struct clk_rcg2 dp_link_clk_src = {
 	.cmd_rcgr = 0x2200,
 	.hid_width = 5,
 	.parent_map = mmss_xo_dp_map,
-	.freq_tbl = ftbl_dp_link_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "dp_link_clk_src",
 		.parent_data = mmss_xo_dp,
 		.num_parents = ARRAY_SIZE(mmss_xo_dp),
-		.ops = &clk_rcg2_ops,
+		.flags = CLK_SET_RATE_PARENT,
+		.ops = &clk_byte2_ops,
 	},
-};
-
-static const struct freq_tbl ftbl_dp_pixel_clk_src[] = {
-	F(154000000, P_DPVCO, 1, 0, 0),
-	F(337500000, P_DPVCO, 2, 0, 0),
-	F(675000000, P_DPVCO, 2, 0, 0),
-	{ }
 };
 
 static struct clk_rcg2 dp_pixel_clk_src = {
 	.cmd_rcgr = 0x2240,
+	.mnd_width = 16,
 	.hid_width = 5,
 	.parent_map = mmss_xo_dp_map,
-	.freq_tbl = ftbl_dp_pixel_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "dp_pixel_clk_src",
 		.parent_data = mmss_xo_dp,
 		.num_parents = ARRAY_SIZE(mmss_xo_dp),
-		.ops = &clk_rcg2_ops,
+		.flags = CLK_SET_RATE_PARENT,
+		.ops = &clk_dp_ops,
 	},
 };
 
@@ -879,14 +866,15 @@ static const struct freq_tbl ftbl_mclk_clk_src[] = {
 	F(16666667, P_GPLL0_DIV, 2, 1, 9),
 	F(19200000, P_XO, 1, 0, 0),
 	F(24000000, P_GPLL0_DIV, 1, 2, 25),
-	F(33333333, P_GPLL0_DIV, 1, 2, 9),
+	F(33333333, P_GPLL0_DIV, 1, 1, 9),
 	F(48000000, P_GPLL0, 1, 2, 25),
-	F(66666667, P_GPLL0, 1, 2, 9),
+	F(66666667, P_GPLL0, 1, 1, 9),
 	{ }
 };
 
 static struct clk_rcg2 mclk0_clk_src = {
 	.cmd_rcgr = 0x3360,
+	.mnd_width = 8,
 	.hid_width = 5,
 	.parent_map = mmss_xo_mmpll4_mmpll7_mmpll10_gpll0_gpll0_div_map,
 	.freq_tbl = ftbl_mclk_clk_src,
@@ -900,6 +888,7 @@ static struct clk_rcg2 mclk0_clk_src = {
 
 static struct clk_rcg2 mclk1_clk_src = {
 	.cmd_rcgr = 0x3390,
+	.mnd_width = 8,
 	.hid_width = 5,
 	.parent_map = mmss_xo_mmpll4_mmpll7_mmpll10_gpll0_gpll0_div_map,
 	.freq_tbl = ftbl_mclk_clk_src,
@@ -913,6 +902,7 @@ static struct clk_rcg2 mclk1_clk_src = {
 
 static struct clk_rcg2 mclk2_clk_src = {
 	.cmd_rcgr = 0x33c0,
+	.mnd_width = 8,
 	.hid_width = 5,
 	.parent_map = mmss_xo_mmpll4_mmpll7_mmpll10_gpll0_gpll0_div_map,
 	.freq_tbl = ftbl_mclk_clk_src,
@@ -926,6 +916,7 @@ static struct clk_rcg2 mclk2_clk_src = {
 
 static struct clk_rcg2 mclk3_clk_src = {
 	.cmd_rcgr = 0x33f0,
+	.mnd_width = 8,
 	.hid_width = 5,
 	.parent_map = mmss_xo_mmpll4_mmpll7_mmpll10_gpll0_gpll0_div_map,
 	.freq_tbl = ftbl_mclk_clk_src,
@@ -1568,6 +1559,47 @@ static struct clk_branch mdss_dp_aux_clk = {
 	},
 };
 
+/*
+ * The byte-interface clock runs at half the byte clock. It has a dedicated
+ * hardware divider, so model it explicitly instead of parenting the interface
+ * branch straight to byte*_clk_src: otherwise the interface's half-rate
+ * request propagates through CLK_SET_RATE_PARENT into the shared PHY byte
+ * source and rewrites the DSI PLL output divider, halving the whole link.
+ */
+static struct clk_regmap_div mdss_byte0_intf_div_clk = {
+	.reg = 0x237c,
+	.shift = 0,
+	.width = 2,
+	/*
+	 * NOTE: Op does not work for div-3. Current assumption is that div-3
+	 * is not a recommended setting for this divider.
+	 */
+	.clkr = {
+		.hw.init = &(struct clk_init_data){
+			.name = "mdss_byte0_intf_div_clk",
+			.parent_hws = (const struct clk_hw *[]){ &byte0_clk_src.clkr.hw },
+			.num_parents = 1,
+			.ops = &clk_regmap_div_ops,
+			.flags = CLK_GET_RATE_NOCACHE,
+		},
+	},
+};
+
+static struct clk_regmap_div mdss_byte1_intf_div_clk = {
+	.reg = 0x2380,
+	.shift = 0,
+	.width = 2,
+	.clkr = {
+		.hw.init = &(struct clk_init_data){
+			.name = "mdss_byte1_intf_div_clk",
+			.parent_hws = (const struct clk_hw *[]){ &byte1_clk_src.clkr.hw },
+			.num_parents = 1,
+			.ops = &clk_regmap_div_ops,
+			.flags = CLK_GET_RATE_NOCACHE,
+		},
+	},
+};
+
 static struct clk_branch mdss_byte0_intf_clk = {
 	.halt_reg = 0x2374,
 	.clkr = {
@@ -1575,10 +1607,10 @@ static struct clk_branch mdss_byte0_intf_clk = {
 		.enable_mask = BIT(0),
 		.hw.init = &(struct clk_init_data){
 			.name = "mdss_byte0_intf_clk",
-			.parent_hws = (const struct clk_hw *[]){ &byte0_clk_src.clkr.hw },
+			.parent_hws = (const struct clk_hw *[]){ &mdss_byte0_intf_div_clk.clkr.hw },
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
 		},
 	},
 };
@@ -1590,10 +1622,10 @@ static struct clk_branch mdss_byte1_intf_clk = {
 		.enable_mask = BIT(0),
 		.hw.init = &(struct clk_init_data){
 			.name = "mdss_byte1_intf_clk",
-			.parent_hws = (const struct clk_hw *[]){ &byte1_clk_src.clkr.hw },
+			.parent_hws = (const struct clk_hw *[]){ &mdss_byte1_intf_div_clk.clkr.hw },
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
 		},
 	},
 };
@@ -2430,7 +2462,15 @@ static struct clk_branch fd_ahb_clk = {
 			.parent_hws = (const struct clk_hw *[]){ &ahb_clk_src.clkr.hw },
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			/*
+			 * The MMSS config NoC carries every register access
+			 * inside MMSS, including the CBCRs of this controller's
+			 * own branches. With it gated a branch enable writes
+			 * the enable bit and then times out waiting for the
+			 * halt bit, so the consumer sees -EBUSY. Same reason
+			 * gcc_mmss_noc_cfg_ahb_clk is critical one level up.
+			 */
+			.flags = CLK_IS_CRITICAL | CLK_SET_RATE_PARENT,
 		},
 	},
 };
@@ -2550,7 +2590,7 @@ static struct gdsc video_subcore0_gdsc = {
 	},
 	.parent = &video_top_gdsc.pd,
 	.pwrsts = PWRSTS_OFF_ON,
-	.flags = HW_CTRL,
+	.flags = HW_CTRL_TRIGGER,
 };
 
 static struct gdsc video_subcore1_gdsc = {
@@ -2562,7 +2602,7 @@ static struct gdsc video_subcore1_gdsc = {
 	},
 	.parent = &video_top_gdsc.pd,
 	.pwrsts = PWRSTS_OFF_ON,
-	.flags = HW_CTRL,
+	.flags = HW_CTRL_TRIGGER,
 };
 
 static struct gdsc mdss_gdsc = {
@@ -2708,6 +2748,8 @@ static struct clk_regmap *mmcc_msm8998_clocks[] = {
 	[MDSS_DP_CRYPTO_CLK] = &mdss_dp_crypto_clk.clkr,
 	[MDSS_DP_PIXEL_CLK] = &mdss_dp_pixel_clk.clkr,
 	[MDSS_DP_AUX_CLK] = &mdss_dp_aux_clk.clkr,
+	[MDSS_BYTE0_INTF_DIV_CLK] = &mdss_byte0_intf_div_clk.clkr,
+	[MDSS_BYTE1_INTF_DIV_CLK] = &mdss_byte1_intf_div_clk.clkr,
 	[MDSS_BYTE0_INTF_CLK] = &mdss_byte0_intf_clk.clkr,
 	[MDSS_BYTE1_INTF_CLK] = &mdss_byte1_intf_clk.clkr,
 	[CAMSS_CSI0PHYTIMER_CLK] = &camss_csi0phytimer_clk.clkr,
