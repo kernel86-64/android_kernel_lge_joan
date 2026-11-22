@@ -12,6 +12,7 @@
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/kernel.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <linux/slab.h>
 #include <linux/soc/qcom/mdt_loader.h>
@@ -1103,6 +1104,45 @@ void adreno_wait_ring(struct msm_ringbuffer *ring, uint32_t ndwords)
 			ring->id);
 }
 
+/*
+ * The generic driver core attaches only the GPU's first power domain, while
+ * msm8998 names both GX and MX.  Attach them by name, without device links,
+ * so adreno_runtime_resume() can power MX first and then GX around the GPU's
+ * own resume callback.
+ */
+static int adreno_attach_pm_domains(struct device *dev,
+				    struct adreno_gpu *adreno_gpu)
+{
+	static const char * const gx_name[] = { "gx" };
+	static const char * const mx_name[] = { "mx" };
+	const struct dev_pm_domain_attach_data gx_data = {
+		.pd_names = gx_name,
+		.num_pd_names = ARRAY_SIZE(gx_name),
+		.pd_flags = PD_FLAG_NO_DEV_LINK,
+	};
+	const struct dev_pm_domain_attach_data mx_data = {
+		.pd_names = mx_name,
+		.num_pd_names = ARRAY_SIZE(mx_name),
+		.pd_flags = PD_FLAG_NO_DEV_LINK | PD_FLAG_REQUIRED_OPP,
+	};
+	int ret;
+
+	/* A lone power domain has already been attached by the driver core */
+	if (dev->pm_domain ||
+	    of_property_match_string(dev->of_node, "power-domain-names", "mx") < 0)
+		return 0;
+
+	ret = devm_pm_domain_attach_list(dev, &gx_data, &adreno_gpu->gx_pd);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "Unable to attach the GX power domain\n");
+
+	ret = devm_pm_domain_attach_list(dev, &mx_data, &adreno_gpu->mx_pd);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "Unable to attach the MX power domain\n");
+
+	return 0;
+}
+
 static int adreno_get_pwrlevels(struct device *dev,
 		struct msm_gpu *gpu)
 {
@@ -1112,6 +1152,20 @@ static int adreno_get_pwrlevels(struct device *dev,
 	int ret;
 
 	gpu->fast_rate = 0;
+
+	/*
+	 * Register VDD_GFX with the OPP framework before the table is added,
+	 * so dev_pm_opp_set_rate() applies the board's opp-microvolt before
+	 * raising the core clock.  The OPP core rejects this later (-EBUSY).
+	 */
+	if (device_property_present(dev, "vdd-supply")) {
+		const char * const supply_names[] = { "vdd", NULL };
+
+		ret = devm_pm_opp_set_regulators(dev, supply_names);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "Unable to register OPP regulators\n");
+	}
 
 	/* devm_pm_opp_of_add_table may error out but will still create an OPP table */
 	ret = devm_pm_opp_of_add_table(dev);
@@ -1236,6 +1290,10 @@ int adreno_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 	adreno_gpu_config.ioname = "kgsl_3d0_reg_memory";
 
 	adreno_gpu_config.nr_rings = nr_rings;
+
+	ret = adreno_attach_pm_domains(dev, adreno_gpu);
+	if (ret)
+		return ret;
 
 	ret = adreno_get_pwrlevels(dev, gpu);
 	if (ret)

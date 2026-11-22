@@ -6,6 +6,9 @@
  * Copyright (c) 2014,2017 The Linux Foundation. All rights reserved.
  */
 
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
+
 #include "adreno_gpu.h"
 
 bool hang_debug = false;
@@ -304,18 +307,61 @@ static const struct of_device_id dt_match[] = {
 };
 MODULE_DEVICE_TABLE(of, dt_match);
 
+/*
+ * Power the domains attached by adreno_attach_pm_domains(), if any. MX goes
+ * first and comes down last; it is powered at no performance level until the
+ * resume callback's dev_pm_opp_set_rate() votes the level of the OPP.
+ */
+static int adreno_pm_domains_get(struct adreno_gpu *adreno_gpu)
+{
+	int ret;
+
+	if (!adreno_gpu->gx_pd || !adreno_gpu->mx_pd)
+		return 0;
+
+	ret = pm_runtime_resume_and_get(adreno_gpu->mx_pd->pd_devs[0]);
+	if (ret)
+		return ret;
+
+	ret = pm_runtime_resume_and_get(adreno_gpu->gx_pd->pd_devs[0]);
+	if (ret)
+		pm_runtime_put_sync(adreno_gpu->mx_pd->pd_devs[0]);
+
+	return ret;
+}
+
+static void adreno_pm_domains_put(struct adreno_gpu *adreno_gpu)
+{
+	if (!adreno_gpu->gx_pd || !adreno_gpu->mx_pd)
+		return;
+
+	pm_runtime_put_sync(adreno_gpu->gx_pd->pd_devs[0]);
+	pm_runtime_put_sync(adreno_gpu->mx_pd->pd_devs[0]);
+}
+
 static int adreno_runtime_resume(struct device *dev)
 {
 	struct msm_gpu *gpu = dev_to_gpu(dev);
-	int ret = gpu->funcs->pm_resume(gpu);
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	int ret;
+
+	ret = adreno_pm_domains_get(adreno_gpu);
+	if (ret)
+		return ret;
+
+	ret = gpu->funcs->pm_resume(gpu);
 	if (!ret)
 		ret = msm_perfcntr_resume(gpu);
+	if (ret)
+		adreno_pm_domains_put(adreno_gpu);
 	return ret;
 }
 
 static int adreno_runtime_suspend(struct device *dev)
 {
 	struct msm_gpu *gpu = dev_to_gpu(dev);
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	int ret;
 
 	/*
 	 * We should be holding a runpm ref, which will prevent
@@ -326,7 +372,13 @@ static int adreno_runtime_suspend(struct device *dev)
 
 	msm_perfcntr_suspend(gpu);
 
-	return gpu->funcs->pm_suspend(gpu);
+	ret = gpu->funcs->pm_suspend(gpu);
+	if (ret)
+		return ret;
+
+	adreno_pm_domains_put(adreno_gpu);
+
+	return 0;
 }
 
 static void suspend_scheduler(struct msm_gpu *gpu)
