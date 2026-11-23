@@ -101,6 +101,8 @@ struct qcom_icc_qos {
  * @bus_clk_desc: a pointer to a rpm_clk_resource description of bus clocks
  * @sum_avg: current sum aggregate value of all avg bw requests
  * @max_peak: current max aggregate value of all peak bw requests
+ * @last_bw: last bandwidth acknowledged by the RPM for each context
+ * @last_bw_valid: bitmap of contexts with an acknowledged bandwidth
  * @mas_rpm_id:	RPM id for devices that are bus masters
  * @slv_rpm_id:	RPM id for devices that are bus slaves
  * @qos: NoC QoS setting parameters
@@ -118,6 +120,8 @@ struct qcom_icc_node {
 	const struct rpm_clk_resource *bus_clk_desc;
 	u64 sum_avg[QCOM_SMD_RPM_STATE_NUM];
 	u64 max_peak[QCOM_SMD_RPM_STATE_NUM];
+	u64 last_bw[QCOM_SMD_RPM_STATE_NUM];
+	u8 last_bw_valid;
 	int mas_rpm_id;
 	int slv_rpm_id;
 	struct qcom_icc_qos qos;

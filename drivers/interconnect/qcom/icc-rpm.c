@@ -213,6 +213,12 @@ static int qcom_icc_rpm_set(struct qcom_icc_node *qn, u64 *bw, bool ignore_enxio
 		return 0;
 
 	for (rpm_ctx = 0; rpm_ctx < QCOM_SMD_RPM_STATE_NUM; rpm_ctx++) {
+		if ((qn->last_bw_valid & BIT(rpm_ctx)) &&
+		    qn->last_bw[rpm_ctx] == bw[rpm_ctx])
+			continue;
+
+		/* A partial failure must also invalidate the previous vote. */
+		qn->last_bw_valid &= ~BIT(rpm_ctx);
 		bw_bps = icc_units_to_bps(bw[rpm_ctx]);
 
 		if (qn->mas_rpm_id != -1) {
@@ -240,6 +246,9 @@ static int qcom_icc_rpm_set(struct qcom_icc_node *qn, u64 *bw, bool ignore_enxio
 					return ret;
 			}
 		}
+
+		qn->last_bw[rpm_ctx] = bw[rpm_ctx];
+		qn->last_bw_valid |= BIT(rpm_ctx);
 	}
 
 	return 0;
@@ -570,6 +579,8 @@ regmap_done:
 
 	for (i = 0; i < num_nodes; i++) {
 		size_t j;
+
+		qnodes[i]->last_bw_valid = 0;
 
 		if (!qnodes[i]->ab_coeff)
 			qnodes[i]->ab_coeff = qp->ab_coeff;
