@@ -828,7 +828,8 @@ static void gsi_channel_program(struct gsi_channel *channel, bool doorbell)
 	struct gsi_channel_scratch_gpi *gpi;
 	struct gsi *gsi = channel->gsi;
 	const struct reg *reg;
-	u32 wrr_weight = 0;
+	/* A zero weight starves a channel in the round-robin scheduler */
+	u32 wrr_weight = 1;
 	u32 offset;
 	u32 val;
 
@@ -921,6 +922,21 @@ static void gsi_channel_program(struct gsi_channel *channel, bool doorbell)
 	/* All done! */
 }
 
+static int gsi_channel_stop_retry(struct gsi_channel *channel)
+{
+	u32 retries = GSI_CHANNEL_STOP_RETRIES;
+	int ret;
+
+	do {
+		ret = gsi_channel_stop_command(channel);
+		if (ret != -EAGAIN)
+			break;
+		usleep_range(3 * USEC_PER_MSEC, 5 * USEC_PER_MSEC);
+	} while (retries--);
+
+	return ret;
+}
+
 static int __gsi_channel_start(struct gsi_channel *channel, bool resume)
 {
 	struct gsi *gsi = channel->gsi;
@@ -931,6 +947,15 @@ static int __gsi_channel_start(struct gsi_channel *channel, bool resume)
 		return 0;
 
 	mutex_lock(&gsi->mutex);
+
+	/*
+	 * A stop that timed out leaves the channel in STOP_IN_PROC, which
+	 * the START command refuses. The stop can complete later, once
+	 * whatever held it has gone (an aggregation frame closing, the
+	 * modem coming back after a restart), so finish it first.
+	 */
+	if (gsi_channel_state(channel) == GSI_CHANNEL_STATE_STOP_IN_PROC)
+		(void)gsi_channel_stop_retry(channel);
 
 	ret = gsi_channel_start_command(channel);
 
@@ -958,32 +983,26 @@ int gsi_channel_start(struct gsi *gsi, u32 channel_id)
 	return ret;
 }
 
-static int gsi_channel_stop_retry(struct gsi_channel *channel)
-{
-	u32 retries = GSI_CHANNEL_STOP_RETRIES;
-	int ret;
-
-	do {
-		ret = gsi_channel_stop_command(channel);
-		if (ret != -EAGAIN)
-			break;
-		usleep_range(3 * USEC_PER_MSEC, 5 * USEC_PER_MSEC);
-	} while (retries--);
-
-	return ret;
-}
 
 static int __gsi_channel_stop(struct gsi_channel *channel, bool suspend)
 {
 	struct gsi *gsi = channel->gsi;
 	int ret;
 
-	/* Wait for any underway transactions to complete before stopping. */
-	gsi_channel_trans_quiesce(channel);
-
-	/* Prior to IPA v4.0 suspend/resume is not implemented by GSI */
+	/* Prior to IPA v4.0 suspend/resume is not implemented by GSI.
+	 *
+	 * Check this before quiescing, not after.  The quiesce is an unbounded
+	 * wait for the last transaction to complete; running it on a path that
+	 * is then a no-op means a suspend can block forever on hardware that
+	 * never delivers the completion.  On msm8998 that hangs
+	 * ipa_runtime_suspend() with the device stuck in RPM_SUSPENDING, after
+	 * which every pm_runtime_get() fails and all uplink traffic is dropped.
+	 */
 	if (suspend && gsi->version < IPA_VERSION_4_0)
 		return 0;
+
+	/* Wait for any underway transactions to complete before stopping. */
+	gsi_channel_trans_quiesce(channel);
 
 	mutex_lock(&gsi->mutex);
 
@@ -1001,14 +1020,19 @@ int gsi_channel_stop(struct gsi *gsi, u32 channel_id)
 	int ret;
 
 	ret = __gsi_channel_stop(channel, false);
-	if (ret)
-		return ret;
 
-	/* Disable the completion interrupt and NAPI if successful */
+	/*
+	 * Disable the completion interrupt and NAPI even if the stop failed.
+	 * The caller treats the channel as stopped either way (the endpoint
+	 * is no longer marked enabled), so the next gsi_channel_start() calls
+	 * napi_enable() again, which BUGs on a NAPI that is still enabled.
+	 * A stop does fail after a modem crash: the GSI STOP command times
+	 * out on the modem-facing channels.
+	 */
 	gsi_irq_ieob_disable_one(gsi, channel->evt_ring_id);
 	napi_disable(&channel->napi);
 
-	return 0;
+	return ret;
 }
 
 /* Reset and reconfigure a channel, (possibly) enabling the doorbell engine */
