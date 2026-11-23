@@ -2307,6 +2307,13 @@ static struct clk_branch gcc_mmss_qm_ahb_clk = {
 		.enable_mask = BIT(0),
 		.hw.init = &(struct clk_init_data){
 			.name = "gcc_mmss_qm_ahb_clk",
+			/*
+			 * The MMSS QoS monitor is accessed by RPM/MPSS once the
+			 * modem finishes EFS bring-up; gating the QM clocks
+			 * after clk_sync_state removal hangs RPM / resets via
+			 * PS_HOLD.
+			 */
+			.flags = CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -2320,6 +2327,7 @@ static struct clk_branch gcc_mmss_qm_core_clk = {
 		.enable_mask = BIT(0),
 		.hw.init = &(struct clk_init_data){
 			.name = "gcc_mmss_qm_core_clk",
+			.flags = CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
