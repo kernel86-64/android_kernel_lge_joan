@@ -190,6 +190,9 @@ struct icc_bwmon {
 	unsigned int min_bw_kbps;
 	unsigned int target_kbps;
 	unsigned int current_kbps;
+	/* Vote for measured traffic * 100 / io_percent */
+	unsigned int io_percent;
+	unsigned int vote_kbps;
 };
 
 /* BWMON v4 */
@@ -686,18 +689,59 @@ static irqreturn_t bwmon_intr_thread(int irq, void *dev_id)
 	bwmon_enable(bwmon, irq_enable);
 
 	trace_qcom_bwmon_update(dev_name(bwmon->dev), meas_kbps, up_kbps, down_kbps);
-	if (bwmon->target_kbps == bwmon->current_kbps)
-		goto out;
 
-	dev_pm_opp_set_opp(bwmon->dev, target_opp);
+	if (bwmon->io_percent < 100) {
+		/*
+		 * The CPUs can only generate as much traffic as the current
+		 * vote lets through; vote above the measured level so the
+		 * monitor can see demand grow, as the vendor bw_hwmon did.
+		 * Scale the measurement, not the OPP it rounded up to, or
+		 * even an idle system never votes below the floor's headroom.
+		 */
+		unsigned int vote_kbps = min_t(u64, (u64)meas_kbps * 100 /
+					      bwmon->io_percent, bwmon->max_bw_kbps);
+		struct dev_pm_opp *vote_opp =
+			dev_pm_opp_find_bw_ceil(bwmon->dev, &vote_kbps, 0);
+
+		if (!IS_ERR(vote_opp)) {
+			if (vote_kbps != bwmon->vote_kbps) {
+				dev_pm_opp_set_opp(bwmon->dev, vote_opp);
+				bwmon->vote_kbps = vote_kbps;
+			}
+			dev_pm_opp_put(vote_opp);
+		}
+	} else if (bwmon->target_kbps != bwmon->current_kbps) {
+		dev_pm_opp_set_opp(bwmon->dev, target_opp);
+	}
 	bwmon->current_kbps = bwmon->target_kbps;
 
-out:
 	dev_pm_opp_put(target_opp);
 	if (!IS_ERR(opp))
 		dev_pm_opp_put(opp);
 
 	return IRQ_HANDLED;
+}
+
+/*
+ * On MSM8998 both BWMON regions lie inside the BIMC register window that the
+ * interconnect driver has already claimed. The drivers use disjoint
+ * registers, so map a busy region without requesting it again.
+ */
+static void __iomem *bwmon_ioremap(struct platform_device *pdev, unsigned int index)
+{
+	struct device *dev = &pdev->dev;
+	struct resource *res;
+	void __iomem *base;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, index);
+	if (!res)
+		return IOMEM_ERR_PTR(-EINVAL);
+
+	/* A busy region is the expected case here, not an error to report. */
+	devm_request_mem_region(dev, res->start, resource_size(res), dev_name(dev));
+
+	base = devm_ioremap(dev, res->start, resource_size(res));
+	return base ?: IOMEM_ERR_PTR(-ENOMEM);
 }
 
 static int bwmon_init_regmap(struct platform_device *pdev,
@@ -709,7 +753,7 @@ static int bwmon_init_regmap(struct platform_device *pdev,
 	int ret;
 
 	/* Map the monitor base */
-	base = devm_platform_ioremap_resource(pdev, 0);
+	base = bwmon_ioremap(pdev, 0);
 	if (IS_ERR(base))
 		return dev_err_probe(dev, PTR_ERR(base),
 				     "failed to map bwmon registers\n");
@@ -732,7 +776,7 @@ static int bwmon_init_regmap(struct platform_device *pdev,
 
 	if (bwmon->data->global_regmap_cfg) {
 		/* Map the global base, if separate */
-		base = devm_platform_ioremap_resource(pdev, 1);
+		base = bwmon_ioremap(pdev, 1);
 		if (IS_ERR(base))
 			return dev_err_probe(dev, PTR_ERR(base),
 					     "failed to map bwmon global registers\n");
@@ -788,6 +832,9 @@ static int bwmon_probe(struct platform_device *pdev)
 	dev_pm_opp_put(opp);
 
 	bwmon->dev = dev;
+	bwmon->io_percent = 100;
+	of_property_read_u32(dev->of_node, "qcom,io-percent", &bwmon->io_percent);
+	bwmon->io_percent = clamp(bwmon->io_percent, 1U, 100U);
 
 	bwmon_disable(bwmon);
 
