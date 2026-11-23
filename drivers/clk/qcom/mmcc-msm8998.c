@@ -2486,7 +2486,12 @@ static struct clk_branch mnoc_ahb_clk = {
 			.parent_hws = (const struct clk_hw *[]){ &ahb_clk_src.clkr.hw },
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			/*
+			 * Needed before mmssnoc/display probe so early MMSS
+			 * consumers such as i2c-qcom-cci can enable
+			 * camss_ahb_clk without timing out.
+			 */
+			.flags = CLK_IS_CRITICAL | CLK_SET_RATE_PARENT,
 		},
 	},
 };
