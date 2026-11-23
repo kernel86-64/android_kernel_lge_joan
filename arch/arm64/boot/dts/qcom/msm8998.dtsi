@@ -1082,7 +1082,7 @@
 			interconnects = <&gnoc MAS_APSS_PROC &bimc SLV_EBI>;
 			#cooling-cells = <2>;
 			capacity-dmips-mhz = <1024>;
-			cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
+			cpu-idle-states = <&little_cpu_sleep_0>;
 			next-level-cache = <&l2_0>;
 			l2_0: l2-cache {
 				compatible = "cache";
@@ -1103,7 +1103,7 @@
 			interconnects = <&gnoc MAS_APSS_PROC &bimc SLV_EBI>;
 			#cooling-cells = <2>;
 			capacity-dmips-mhz = <1024>;
-			cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
+			cpu-idle-states = <&little_cpu_sleep_0>;
 			next-level-cache = <&l2_0>;
 		};
 
@@ -1119,7 +1119,7 @@
 			interconnects = <&gnoc MAS_APSS_PROC &bimc SLV_EBI>;
 			#cooling-cells = <2>;
 			capacity-dmips-mhz = <1024>;
-			cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
+			cpu-idle-states = <&little_cpu_sleep_0>;
 			next-level-cache = <&l2_0>;
 		};
 
@@ -1135,7 +1135,7 @@
 			interconnects = <&gnoc MAS_APSS_PROC &bimc SLV_EBI>;
 			#cooling-cells = <2>;
 			capacity-dmips-mhz = <1024>;
-			cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
+			cpu-idle-states = <&little_cpu_sleep_0>;
 			next-level-cache = <&l2_0>;
 		};
 
@@ -1151,7 +1151,7 @@
 			interconnects = <&gnoc MAS_APSS_PROC &bimc SLV_EBI>;
 			#cooling-cells = <2>;
 			capacity-dmips-mhz = <1536>;
-			cpu-idle-states = <&big_cpu_sleep_0 &big_cpu_sleep_1>;
+			cpu-idle-states = <&big_cpu_sleep_0>;
 			next-level-cache = <&l2_1>;
 			l2_1: l2-cache {
 				compatible = "cache";
@@ -1172,7 +1172,7 @@
 			interconnects = <&gnoc MAS_APSS_PROC &bimc SLV_EBI>;
 			#cooling-cells = <2>;
 			capacity-dmips-mhz = <1536>;
-			cpu-idle-states = <&big_cpu_sleep_0 &big_cpu_sleep_1>;
+			cpu-idle-states = <&big_cpu_sleep_0>;
 			next-level-cache = <&l2_1>;
 		};
 
@@ -1188,7 +1188,7 @@
 			interconnects = <&gnoc MAS_APSS_PROC &bimc SLV_EBI>;
 			#cooling-cells = <2>;
 			capacity-dmips-mhz = <1536>;
-			cpu-idle-states = <&big_cpu_sleep_0 &big_cpu_sleep_1>;
+			cpu-idle-states = <&big_cpu_sleep_0>;
 			next-level-cache = <&l2_1>;
 		};
 
@@ -1204,7 +1204,7 @@
 			interconnects = <&gnoc MAS_APSS_PROC &bimc SLV_EBI>;
 			#cooling-cells = <2>;
 			capacity-dmips-mhz = <1536>;
-			cpu-idle-states = <&big_cpu_sleep_0 &big_cpu_sleep_1>;
+			cpu-idle-states = <&big_cpu_sleep_0>;
 			next-level-cache = <&l2_1>;
 		};
 
