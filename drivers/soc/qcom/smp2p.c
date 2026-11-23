@@ -187,20 +187,21 @@ static bool qcom_smp2p_check_ssr(struct qcom_smp2p *smp2p)
 	struct smp2p_smem_item *in = smp2p->in;
 	struct smp2p_entry *entry;
 	bool restart_done;
-	bool restart;
 
 	if (!smp2p->ssr_ack_enabled)
 		return false;
 
 	restart_done = in->flags & BIT(SMP2P_FLAGS_RESTART_DONE_BIT);
-	restart = restart_done != smp2p->ssr_ack;
+	if (restart_done == smp2p->ssr_ack)
+		return false;
+
 	list_for_each_entry(entry, &smp2p->inbound, node) {
 		if (!entry->value)
 			continue;
 		entry->last_value = 0;
 	}
 
-	return restart;
+	return true;
 }
 
 static void qcom_smp2p_do_ssr_ack(struct qcom_smp2p *smp2p)
