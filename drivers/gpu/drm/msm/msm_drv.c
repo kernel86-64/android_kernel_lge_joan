@@ -68,8 +68,9 @@ bool msm_gpu_no_components(void)
 
 static int msm_drm_uninit(struct device *dev, const struct component_ops *gpu_ops)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct msm_drm_private *priv = platform_get_drvdata(pdev);
+	/* A standalone GPU stores adreno_smmu_priv in its platform drvdata. */
+	struct msm_drm_private *priv = gpu_ops ?
+		dev_to_gpu(dev)->dev->dev_private : dev_get_drvdata(dev);
 	struct drm_device *ddev = priv->dev;
 
 	/*
