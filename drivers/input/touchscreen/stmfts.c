@@ -17,6 +17,7 @@
 #include <linux/property.h>
 #include <linux/unaligned.h>
 #include <linux/regulator/consumer.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_panel.h>
 
@@ -133,6 +134,8 @@ struct stmfts_data {
 	struct gpio_desc *reset_gpio;
 	struct led_classdev led_cdev;
 	struct mutex mutex;
+	/* Command completion still needs the IRQ handler's mutex. */
+	struct mutex power_lock;
 
 	struct touchscreen_properties prop;
 
@@ -155,6 +158,7 @@ struct stmfts_data {
 	struct completion cmd_done;
 
 	struct drm_panel_follower panel_follower;
+	struct work_struct panel_work;
 
 	bool use_key;
 	bool led_status;
@@ -163,6 +167,7 @@ struct stmfts_data {
 	bool powered;
 	bool follow_panel;
 	bool panel_on;
+	bool suspended;
 };
 
 static int stmfts_brightness_set(struct led_classdev *led_cdev,
@@ -502,17 +507,15 @@ static int stmfts_input_open(struct input_dev *dev)
 	if (err)
 		return err;
 
-	scoped_guard(mutex, &sdata->mutex)
-		sdata->running = true;
-
 	/*
 	 * When following the panel, the controller is off while the panel
-	 * is; stmfts_panel_prepared() starts sensing once it is powered.
+	 * is; panel_work starts sensing once the controller is powered.
 	 */
-	err = sdata->powered ? stmfts_start_sensing(sdata) : 0;
+	scoped_guard(mutex, &sdata->power_lock) {
+		err = sdata->powered ? stmfts_start_sensing(sdata) : 0;
+		sdata->running = !err;
+	}
 	if (err) {
-		scoped_guard(mutex, &sdata->mutex)
-			sdata->running = false;
 		pm_runtime_put_sync(&sdata->client->dev);
 		return err;
 	}
@@ -525,21 +528,16 @@ static void stmfts_input_close(struct input_dev *dev)
 	struct stmfts_data *sdata = input_get_drvdata(dev);
 	int err;
 
-	if (!sdata->powered) {
-		/* The panel has the controller off; there is nothing to stop. */
-		scoped_guard(mutex, &sdata->mutex)
-			sdata->running = false;
-		pm_runtime_put_sync(&sdata->client->dev);
-		return;
-	}
-
-	err = i2c_smbus_write_byte(sdata->client, STMFTS_MS_MT_SENSE_OFF);
-	if (err)
-		dev_warn(&sdata->client->dev,
-			 "failed to disable touchscreen: %d\n", err);
-
-	scoped_guard(mutex, &sdata->mutex) {
+	scoped_guard(mutex, &sdata->power_lock) {
 		sdata->running = false;
+
+		if (!sdata->powered)
+			break;
+
+		err = i2c_smbus_write_byte(sdata->client, STMFTS_MS_MT_SENSE_OFF);
+		if (err)
+			dev_warn(&sdata->client->dev,
+				 "failed to disable touchscreen: %d\n", err);
 
 		if (sdata->hover_enabled) {
 			err = i2c_smbus_write_byte(sdata->client,
@@ -548,14 +546,13 @@ static void stmfts_input_close(struct input_dev *dev)
 				dev_warn(&sdata->client->dev,
 					 "failed to disable hover: %d\n", err);
 		}
-	}
-
-	if (sdata->use_key) {
-		err = i2c_smbus_write_byte(sdata->client,
-					   STMFTS_MS_KEY_SENSE_OFF);
-		if (err)
-			dev_warn(&sdata->client->dev,
-				 "failed to disable touchkey: %d\n", err);
+		if (sdata->use_key) {
+			err = i2c_smbus_write_byte(sdata->client,
+						   STMFTS_MS_KEY_SENSE_OFF);
+			if (err)
+				dev_warn(&sdata->client->dev,
+					 "failed to disable touchkey: %d\n", err);
+		}
 	}
 
 	pm_runtime_put_sync(&sdata->client->dev);
@@ -625,6 +622,7 @@ static ssize_t stmfts_sysfs_hover_enable_read(struct device *dev,
 {
 	struct stmfts_data *sdata = dev_get_drvdata(dev);
 
+	guard(mutex)(&sdata->power_lock);
 	return sysfs_emit(buf, "%u\n", sdata->hover_enabled);
 }
 
@@ -642,10 +640,10 @@ static ssize_t stmfts_sysfs_hover_enable_write(struct device *dev,
 
 	hover = !!value;
 
-	guard(mutex)(&sdata->mutex);
+	guard(mutex)(&sdata->power_lock);
 
 	if (hover != sdata->hover_enabled) {
-		if (sdata->running) {
+		if (sdata->running && sdata->powered) {
 			err = i2c_smbus_write_byte(sdata->client,
 						   value ? STMFTS_SS_HOVER_SENSE_ON :
 							   STMFTS_SS_HOVER_SENSE_OFF);
@@ -1022,19 +1020,35 @@ static void stmfts_power_off(void *data)
  * it is prepared, it cannot, and it is in a known good state for the first
  * taps.
  */
-static int stmfts_panel_prepared(struct drm_panel_follower *follower)
+static void stmfts_panel_power_work(struct work_struct *work)
 {
-	struct stmfts_data *sdata = container_of(follower, struct stmfts_data,
-						 panel_follower);
+	struct stmfts_data *sdata = container_of(work, struct stmfts_data,
+						 panel_work);
 	int err;
 
-	sdata->panel_on = true;
+	guard(mutex)(&sdata->power_lock);
+	if (!sdata->panel_on || sdata->suspended)
+		return;
 
 	err = stmfts_power_on(sdata);
 	if (!err && sdata->running)
 		err = stmfts_start_sensing(sdata);
+	if (err)
+		dev_err(&sdata->client->dev, "failed to start panel touchscreen: %d\n", err);
+}
 
-	return err;
+static int stmfts_panel_prepared(struct drm_panel_follower *follower)
+{
+	struct stmfts_data *sdata = container_of(follower, struct stmfts_data,
+						 panel_follower);
+
+	/* The modeset can finish while the controller calibrates. */
+	guard(mutex)(&sdata->power_lock);
+	sdata->panel_on = true;
+	if (!sdata->suspended)
+		queue_work(system_freezable_wq, &sdata->panel_work);
+
+	return 0;
 }
 
 static int stmfts_panel_unpreparing(struct drm_panel_follower *follower)
@@ -1042,9 +1056,12 @@ static int stmfts_panel_unpreparing(struct drm_panel_follower *follower)
 	struct stmfts_data *sdata = container_of(follower, struct stmfts_data,
 						 panel_follower);
 
-	sdata->panel_on = false;
-	stmfts_power_off(sdata);
+	scoped_guard(mutex, &sdata->power_lock)
+		sdata->panel_on = false;
+	cancel_work_sync(&sdata->panel_work);
 
+	guard(mutex)(&sdata->power_lock);
+	stmfts_power_off(sdata);
 	return 0;
 }
 
@@ -1100,7 +1117,9 @@ static int stmfts_probe(struct i2c_client *client)
 
 	sdata->client = client;
 	mutex_init(&sdata->mutex);
+	mutex_init(&sdata->power_lock);
 	init_completion(&sdata->cmd_done);
+	INIT_WORK(&sdata->panel_work, stmfts_panel_power_work);
 
 	err = devm_regulator_bulk_get_const(dev,
 					    ARRAY_SIZE(stmfts_supplies),
@@ -1198,8 +1217,10 @@ static int stmfts_probe(struct i2c_client *client)
 					     "failed to follow the panel\n");
 
 		/* Otherwise stay off until the panel comes up */
-		if (!sdata->panel_on)
-			stmfts_power_off(sdata);
+		scoped_guard(mutex, &sdata->power_lock) {
+			if (!sdata->panel_on)
+				stmfts_power_off(sdata);
+		}
 	}
 
 	err = input_register_device(sdata->input);
@@ -1236,6 +1257,7 @@ static int stmfts_runtime_suspend(struct device *dev)
 	struct stmfts_data *sdata = dev_get_drvdata(dev);
 	int ret;
 
+	guard(mutex)(&sdata->power_lock);
 	/* Already off with the panel */
 	if (!sdata->powered)
 		return 0;
@@ -1260,7 +1282,8 @@ static int stmfts_runtime_resume(struct device *dev)
 	 * whether the latency is acceptable vs. finding the exact
 	 * SLEEP_OUT failure mode.
 	 */
-	if (sdata->follow_panel && !sdata->panel_on)
+	guard(mutex)(&sdata->power_lock);
+	if (sdata->follow_panel)
 		return 0;
 
 	return stmfts_power_on(sdata);
@@ -1270,8 +1293,12 @@ static int stmfts_suspend(struct device *dev)
 {
 	struct stmfts_data *sdata = dev_get_drvdata(dev);
 
-	stmfts_power_off(sdata);
+	scoped_guard(mutex, &sdata->power_lock)
+		sdata->suspended = true;
+	cancel_work_sync(&sdata->panel_work);
 
+	guard(mutex)(&sdata->power_lock);
+	stmfts_power_off(sdata);
 	return 0;
 }
 
@@ -1280,9 +1307,13 @@ static int stmfts_resume(struct device *dev)
 	struct stmfts_data *sdata = dev_get_drvdata(dev);
 	int err;
 
-	/* stmfts_panel_prepared() powers us when the panel comes back */
-	if (sdata->follow_panel && !sdata->panel_on)
+	guard(mutex)(&sdata->power_lock);
+	sdata->suspended = false;
+	if (sdata->follow_panel) {
+		if (sdata->panel_on)
+			queue_work(system_freezable_wq, &sdata->panel_work);
 		return 0;
+	}
 
 	err = stmfts_power_on(sdata);
 	if (!err && sdata->running)
