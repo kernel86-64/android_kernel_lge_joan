@@ -15,6 +15,7 @@
 #include <uapi/linux/input-event-codes.h>
 #include "common.h"
 #include "qdsp6/q6afe.h"
+#include "qdsp6/q6voice.h"
 #include "sdw.h"
 #include "../codecs/rt5663.h"
 
@@ -635,9 +636,100 @@ static const struct snd_soc_dapm_widget sdm845_snd_widgets[] = {
 	SND_SOC_DAPM_MIC("Int Mic", NULL),
 };
 
+#if IS_REACHABLE(CONFIG_SND_SOC_QDSP6_VOICE)
+static int sdm845_voice_call_get(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.integer.value[0] = q6voice_get_state() ? 1 : 0;
+	return 0;
+}
+
+static int sdm845_voice_call_put(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_value *ucontrol)
+{
+	bool enable = ucontrol->value.integer.value[0] != 0;
+	bool prev = q6voice_get_state();
+	int ret;
+
+	ret = q6voice_set_state(enable);
+	if (ret)
+		return ret;
+
+	return prev != enable ? 1 : 0;
+}
+
+static const char * const sdm845_voice_rx_port_texts[Q6VOICE_RX_PORT_MAX] = {
+	[Q6VOICE_RX_SLIMBUS_0] = "SLIMBUS_0_RX",
+	[Q6VOICE_RX_TERT_MI2S] = "TERT_MI2S_RX",
+	[Q6VOICE_RX_QUAT_MI2S] = "QUAT_MI2S_RX",
+};
+
+static SOC_ENUM_SINGLE_EXT_DECL(sdm845_voice_rx_port_enum,
+				sdm845_voice_rx_port_texts);
+
+static int sdm845_voice_rx_port_get(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.enumerated.item[0] = q6voice_get_rx_port_idx();
+	return 0;
+}
+
+static int sdm845_voice_rx_port_put(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_value *ucontrol)
+{
+	int idx = ucontrol->value.enumerated.item[0];
+	int prev = q6voice_get_rx_port_idx();
+	int ret;
+
+	ret = q6voice_set_rx_port_idx(idx);
+	if (ret)
+		return ret;
+
+	return prev != idx ? 1 : 0;
+}
+
+static const char * const sdm845_voice_session_texts[Q6VOICE_SESSION_MAX] = {
+	[Q6VOICE_SESSION_MMODE1] = "VOICEMMODE1",
+	[Q6VOICE_SESSION_MMODE2] = "VOICEMMODE2",
+	[Q6VOICE_SESSION_VOICE]  = "VOICE",
+};
+
+static SOC_ENUM_SINGLE_EXT_DECL(sdm845_voice_session_enum,
+				sdm845_voice_session_texts);
+
+static int sdm845_voice_session_get(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.enumerated.item[0] = q6voice_get_session();
+	return 0;
+}
+
+static int sdm845_voice_session_put(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_value *ucontrol)
+{
+	int sess = ucontrol->value.enumerated.item[0];
+	int prev = q6voice_get_session();
+	int ret;
+
+	ret = q6voice_set_session(sess);
+	if (ret)
+		return ret;
+
+	return prev != sess ? 1 : 0;
+}
+#endif
+
 static const struct snd_kcontrol_new sdm845_snd_controls[] = {
 	SOC_DAPM_PIN_SWITCH("Headphone Jack"),
 	SOC_DAPM_PIN_SWITCH("Headset Mic"),
+#if IS_REACHABLE(CONFIG_SND_SOC_QDSP6_VOICE)
+	SOC_SINGLE_BOOL_EXT("Voice Call", 0,
+			    sdm845_voice_call_get, sdm845_voice_call_put),
+	SOC_ENUM_EXT("Voice Rx Port", sdm845_voice_rx_port_enum,
+		     sdm845_voice_rx_port_get, sdm845_voice_rx_port_put),
+	SOC_ENUM_EXT("Voice Session", sdm845_voice_session_enum,
+		     sdm845_voice_session_get, sdm845_voice_session_put),
+#endif
 };
 
 static void sdm845_add_ops(struct snd_soc_card *card)
