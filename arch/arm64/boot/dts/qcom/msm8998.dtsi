@@ -4465,7 +4465,7 @@
 				assigned-clock-rates = <19200000>;
 
 				operating-points-v2 = <&mdp_opp_table>;
-				power-domains = <&rpmpd RPMPD_VDDMX>;
+				power-domains = <&rpmpd RPMPD_VDDCX>;
 
 				mdp_opp_table: opp-table {
 					compatible = "operating-points-v2";
