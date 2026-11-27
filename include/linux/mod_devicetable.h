@@ -78,4 +78,19 @@ struct cpu_feature {
 	__u16	feature;
 };
 
+#define QRTR_NAME_SIZE	32
+#define QRTR_MODULE_PREFIX "qrtr:"
+
+/**
+ * struct qrtr_device_id - QRTR device identifier
+ * @service: Service ID
+ * @instance: Instance ID
+ * @driver_data: Data private to the driver
+ */
+struct qrtr_device_id {
+	__u16 service;
+	__u16 instance;
+	kernel_ulong_t driver_data;	/* Data private to the driver */
+};
+
 #endif /* LINUX_MOD_DEVICETABLE_H */
