@@ -1236,21 +1236,17 @@ static void ipa_endpoint_init_seq(struct ipa_endpoint *endpoint)
 int ipa_endpoint_skb_tx(struct ipa_endpoint *endpoint, struct sk_buff *skb)
 {
 	struct gsi_trans *trans;
-	u32 nr_frags;
 	int ret;
 
-	/* Make sure source endpoint's TLV FIFO has enough entries to
-	 * hold the linear portion of the skb and all its fragments.
-	 * If not, see if we can linearize it before giving up.
+	/* gsi_trans_skb_add() requires a single TRE (rsvd_count == 1).
+	 * Linearize paged or frag_list SKBs before mapping for DMA so
+	 * rmnet scatter-gather packets never fail with -EINVAL/-ENOMEM
+	 * and spin in NETDEV_TX_BUSY.
 	 */
-	nr_frags = skb_shinfo(skb)->nr_frags;
-	if (nr_frags > endpoint->skb_frag_max) {
-		if (skb_linearize(skb))
-			return -E2BIG;
-		nr_frags = 0;
-	}
+	if (skb_is_nonlinear(skb) && skb_linearize(skb))
+		return -E2BIG;
 
-	trans = ipa_endpoint_trans_alloc(endpoint, 1 + nr_frags);
+	trans = ipa_endpoint_trans_alloc(endpoint, 1);
 	if (!trans)
 		return -EBUSY;
 
