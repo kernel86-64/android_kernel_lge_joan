@@ -4,7 +4,9 @@
  * Author: Rob Clark <robdclark@gmail.com>
  */
 
+#include <linux/kthread.h>
 #include <drm/drm_atomic_uapi.h>
+#include <drm/drm_self_refresh_helper.h>
 #include <drm/drm_vblank.h>
 
 #include "msm_atomic_trace.h"
@@ -217,6 +219,21 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
 	return 0;
 }
 
+static bool msm_atomic_state_needs_modeset(struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_crtc *crtc;
+	unsigned int i;
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+		if (!new_crtc_state->active ||
+		    drm_atomic_crtc_needs_modeset(new_crtc_state))
+			return true;
+	}
+
+	return false;
+}
+
 void msm_atomic_commit_tail(struct drm_atomic_commit *state)
 {
 	struct drm_device *dev = state->dev;
@@ -296,36 +313,169 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
 	}
 
 fallback:
+	{
+		bool early_hw_done = !msm_atomic_state_needs_modeset(state);
+
+		/*
+		 * If there is any async flush pending on updated crtcs, fold
+		 * them into the current flush.
+		 */
+		kms->pending_crtc_mask &= ~crtc_mask;
+
+		vblank_get(kms, crtc_mask);
+
+		/*
+		 * Flush hardware updates:
+		 */
+		trace_msm_atomic_flush_commit(crtc_mask);
+		kms->funcs->flush_commit(kms, crtc_mask);
+		unlock_crtcs(kms, crtc_mask);
+
+		/*
+		 * For active non-modeset page-flips executed on our single
+		 * ordered commit_worker, hardware register programming is
+		 * already flushed and CTL_START triggered. Signal hw_done
+		 * before the ~15ms command-mode PP_DONE wait so the next
+		 * DRM_MODE_ATOMIC_NONBLOCK commit can swap state and queue
+		 * directly behind us without stalling HWC/SurfaceFlinger.
+		 */
+		if (early_hw_done)
+			drm_atomic_helper_commit_hw_done(state);
+
+		/*
+		 * Wait for flush to complete:
+		 */
+		trace_msm_atomic_wait_flush_start(crtc_mask);
+		kms->funcs->wait_flush(kms, crtc_mask);
+		trace_msm_atomic_wait_flush_finish(crtc_mask);
+
+		vblank_put(kms, crtc_mask);
+
+		lock_crtcs(kms, crtc_mask);
+		kms->funcs->complete_commit(kms, crtc_mask);
+		unlock_crtcs(kms, crtc_mask);
+		kms->funcs->disable_commit(kms);
+
+		if (!early_hw_done)
+			drm_atomic_helper_commit_hw_done(state);
+		drm_atomic_helper_cleanup_planes(dev, state);
+
+		trace_msm_atomic_commit_tail_finish(async, crtc_mask);
+	}
+}
+
+struct msm_commit_work {
+	struct kthread_work work;
+	struct drm_atomic_commit *state;
+};
+
+static void msm_commit_tail(struct drm_atomic_commit *state)
+{
+	struct drm_device *dev = state->dev;
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_crtc *crtc;
+	ktime_t start;
+	s64 commit_time_ms;
+	unsigned int i, new_self_refresh_mask = 0;
+
+	start = ktime_get();
+
+	drm_atomic_helper_wait_for_fences(dev, state, false);
+	drm_atomic_helper_wait_for_dependencies(state);
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i)
+		if (new_crtc_state->self_refresh_active)
+			new_self_refresh_mask |= BIT(i);
+
+	msm_atomic_commit_tail(state);
+
+	commit_time_ms = ktime_ms_delta(ktime_get(), start);
+	if (commit_time_ms > 0)
+		drm_self_refresh_helper_update_avg_times(state,
+						 (unsigned long)commit_time_ms,
+						 new_self_refresh_mask);
+
+	drm_atomic_helper_commit_cleanup_done(state);
+	drm_atomic_commit_put(state);
+}
+
+static void msm_commit_work_fn(struct kthread_work *work)
+{
+	struct msm_commit_work *cw =
+		container_of(work, struct msm_commit_work, work);
+	struct drm_atomic_commit *state = cw->state;
+
+	kfree(cw);
+	msm_commit_tail(state);
+}
+
+int msm_atomic_commit(struct drm_device *dev, struct drm_atomic_commit *state,
+		      bool nonblock)
+{
+	struct msm_drm_private *priv = dev->dev_private;
+	struct msm_kms *kms = priv->kms;
+	struct msm_commit_work *cw = NULL;
+	int ret;
+
+	if (!kms || !kms->commit_worker)
+		return drm_atomic_helper_commit(dev, state, nonblock);
+
+	if (state->async_update) {
+		ret = drm_atomic_helper_prepare_planes(dev, state);
+		if (ret)
+			return ret;
+
+		drm_atomic_helper_async_commit(dev, state);
+		drm_atomic_helper_unprepare_planes(dev, state);
+
+		return 0;
+	}
+
+	if (nonblock) {
+		cw = kmalloc(sizeof(*cw), GFP_KERNEL);
+		if (!cw)
+			return -ENOMEM;
+		kthread_init_work(&cw->work, msm_commit_work_fn);
+		cw->state = state;
+	}
+
+	ret = drm_atomic_helper_setup_commit(state, nonblock);
+	if (ret)
+		goto err_free;
+
+	ret = drm_atomic_helper_prepare_planes(dev, state);
+	if (ret)
+		goto err_free;
+
+	if (!nonblock) {
+		ret = drm_atomic_helper_wait_for_fences(dev, state, true);
+		if (ret)
+			goto err_unprepare;
+	}
+
 	/*
-	 * If there is any async flush pending on updated crtcs, fold
-	 * them into the current flush.
+	 * Ensure any prior non-modeset commit that signaled hw_done early
+	 * has finished wait_flush/complete_commit before a modeset or
+	 * synchronous commit swaps object state.
 	 */
-	kms->pending_crtc_mask &= ~crtc_mask;
+	if (msm_atomic_state_needs_modeset(state) || !nonblock)
+		kthread_flush_worker(kms->commit_worker);
 
-	vblank_get(kms, crtc_mask);
+	ret = drm_atomic_helper_swap_state(state, true);
+	if (ret)
+		goto err_unprepare;
 
-	/*
-	 * Flush hardware updates:
-	 */
-	trace_msm_atomic_flush_commit(crtc_mask);
-	kms->funcs->flush_commit(kms, crtc_mask);
-	unlock_crtcs(kms, crtc_mask);
-	/*
-	 * Wait for flush to complete:
-	 */
-	trace_msm_atomic_wait_flush_start(crtc_mask);
-	kms->funcs->wait_flush(kms, crtc_mask);
-	trace_msm_atomic_wait_flush_finish(crtc_mask);
+	drm_atomic_commit_get(state);
+	if (nonblock)
+		kthread_queue_work(kms->commit_worker, &cw->work);
+	else
+		msm_commit_tail(state);
 
-	vblank_put(kms, crtc_mask);
+	return 0;
 
-	lock_crtcs(kms, crtc_mask);
-	kms->funcs->complete_commit(kms, crtc_mask);
-	unlock_crtcs(kms, crtc_mask);
-	kms->funcs->disable_commit(kms);
-
-	drm_atomic_helper_commit_hw_done(state);
-	drm_atomic_helper_cleanup_planes(dev, state);
-
-	trace_msm_atomic_commit_tail_finish(async, crtc_mask);
+err_unprepare:
+	drm_atomic_helper_unprepare_planes(dev, state);
+err_free:
+	kfree(cw);
+	return ret;
 }

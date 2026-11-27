@@ -185,6 +185,7 @@ struct msm_kms {
 	struct msm_pending_timer pending_timers[MAX_CRTCS];
 
 	struct workqueue_struct *wq;
+	struct kthread_worker *commit_worker;
 	struct msm_drm_thread event_thread[MAX_CRTCS];
 };
 

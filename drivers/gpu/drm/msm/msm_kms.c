@@ -24,7 +24,7 @@
 static const struct drm_mode_config_funcs mode_config_funcs = {
 	.fb_create = msm_framebuffer_create,
 	.atomic_check = msm_atomic_check,
-	.atomic_commit = drm_atomic_helper_commit,
+	.atomic_commit = msm_atomic_commit,
 };
 
 static const struct drm_mode_config_helper_funcs mode_config_helper_funcs = {
@@ -242,6 +242,11 @@ void msm_drm_kms_uninit(struct device *dev)
 
 	flush_workqueue(kms->wq);
 
+	if (kms->commit_worker) {
+		kthread_destroy_worker(kms->commit_worker);
+		kms->commit_worker = NULL;
+	}
+
 	/* clean up event worker threads */
 	for (i = 0; i < MAX_CRTCS; i++) {
 		if (kms->event_thread[i].worker)
@@ -299,6 +304,15 @@ int msm_drm_kms_init(struct device *dev, const struct drm_driver *drv)
 	}
 
 	drm_helper_move_panel_connectors_to_head(ddev);
+
+	kms->commit_worker = kthread_run_worker(0, "msm_commit");
+	if (IS_ERR(kms->commit_worker)) {
+		ret = PTR_ERR(kms->commit_worker);
+		DRM_DEV_ERROR(dev, "failed to create msm_commit kthread\n");
+		kms->commit_worker = NULL;
+		goto err_msm_uninit;
+	}
+	sched_set_fifo(kms->commit_worker->task);
 
 	drm_for_each_crtc(crtc, ddev) {
 		struct msm_drm_thread *ev_thread;
