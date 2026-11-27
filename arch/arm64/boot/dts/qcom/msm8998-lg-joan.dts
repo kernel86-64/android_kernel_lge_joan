@@ -421,14 +421,14 @@
 
 	/*
 	 * Laser autofocus (LG's "proxy", VL53L0), on the same bus as the main
-	 * camera.  LDAF_EN (GPIO 25) drives its XSHUT.  LG lists no supply
-	 * for it; it is taken to share the main camera module's analog rail.
+	 * camera.  LDAF_EN (GPIO 25) drives its XSHUT; its 2.8V supply is
+	 * shared with the rear camera AF/OIS rail CAM0_VAF (PM8998 GPIO 7).
 	 */
 	proximity@29 {
 		compatible = "st,vl53l0x";
 		reg = <0x29>;
 		reset-gpios = <&tlmm 25 GPIO_ACTIVE_LOW>;
-		vdd-supply = <&cam0_avdd_2p8>;
+		vdd-supply = <&cam0_vaf>;
 	};
 
 	/*
