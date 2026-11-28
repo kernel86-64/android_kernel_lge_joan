@@ -2157,6 +2157,53 @@ static int qcom_scm_qseecom_call(const struct qcom_scm_desc *desc,
 }
 
 /**
+ * qcom_scm_qseecom_raw_call() - Perform a raw QSEECOM SCM call.
+ * @owner:   SMC owner ID (e.g. TZ_OWNER_QSEE_OS, TZ_OWNER_TZ_APPS, TZ_OWNER_SIP).
+ * @svc:     Service ID.
+ * @cmd:     Command ID.
+ * @arginfo: Encoded argument count and types (QCOM_SCM_ARGS format).
+ * @args:    Up to 10 SMC arguments (may be NULL if nargs == 0).
+ * @res:     Optional 3-element array receiving result, resp_type, data.
+ *
+ * Serializes the SMC call under qcom_scm_qseecom_call_lock and returns the raw
+ * QSEE response including INCOMPLETE / BLOCKED_ON_LISTENER so callers such as
+ * /dev/qseecom can drive userspace listener loops.
+ *
+ * Return: Zero on SCM transport success, negative errno on failure.
+ */
+int qcom_scm_qseecom_raw_call(u32 owner, u32 svc, u32 cmd, u32 arginfo,
+			      const u64 args[10], u64 res[3])
+{
+	struct qcom_scm_desc desc = {
+		.owner = owner,
+		.svc = svc,
+		.cmd = cmd,
+		.arginfo = arginfo,
+	};
+	struct qcom_scm_qseecom_resp qres = {};
+	int status;
+
+	if (!__scm)
+		return -ENODEV;
+
+	if (args)
+		memcpy(desc.args, args, sizeof(desc.args));
+
+	mutex_lock(&qcom_scm_qseecom_call_lock);
+	status = __qcom_scm_qseecom_call(&desc, &qres);
+	mutex_unlock(&qcom_scm_qseecom_call_lock);
+
+	if (res) {
+		res[0] = qres.result;
+		res[1] = qres.resp_type;
+		res[2] = qres.data;
+	}
+
+	return status;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_raw_call);
+
+/**
  * qcom_scm_qseecom_get_version() - Query the QSEECOM version.
  * @version: Pointer where the QSEECOM version will be stored.
  *
