@@ -272,7 +272,7 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 	qsdev->ep.add_device = qcom_smd_qrtr_add_device;
 	qsdev->ep.del_device = qcom_smd_qrtr_del_device;
 	spin_lock_init(&qsdev->rx_lock);
-	qsdev->service_wq = alloc_ordered_workqueue("qrtr-%s", 0, dev_name(qsdev->dev));
+	qsdev->service_wq = alloc_ordered_workqueue("qrtr-smd", 0);
 	if (!qsdev->service_wq)
 		return -ENOMEM;
 
