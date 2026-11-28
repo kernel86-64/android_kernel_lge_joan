@@ -59,6 +59,20 @@ static int sg_version_num = 30536;	/* 2 digits for each component */
 #include <scsi/scsi_ioctl.h>
 #include <scsi/scsi_tcq.h>
 #include <scsi/sg.h>
+#if IS_REACHABLE(CONFIG_SCSI_UFSHCD)
+#include <ufs/ufshcd.h>
+
+/* CAF userspace ABI used by the legacy RPMB listener. */
+#define UFS_IOCTL_QUERY		0x5388
+
+struct ufs_ioctl_query_hdr {
+	u32 opcode;
+	u8 idn;
+	u8 index;
+	u16 buf_size;
+};
+
+#endif /* CONFIG_SCSI_UFSHCD */
 
 #include "scsi_logging.h"
 
@@ -1129,6 +1143,50 @@ sg_ioctl_common(struct file *filp, Sg_device *sdp, Sg_fd *sfp,
 		if (atomic_read(&sdp->detaching))
 			return -ENODEV;
 		break;
+#if IS_REACHABLE(CONFIG_SCSI_UFSHCD)
+	case UFS_IOCTL_QUERY: {
+		struct ufs_ioctl_query_hdr hdr;
+		struct ufs_hba *hba;
+		u8 *kbuf;
+		int len, err;
+
+		if (atomic_read(&sdp->detaching))
+			return -ENODEV;
+		if (!sdp->device || !sdp->device->host ||
+		    !sdp->device->host->hostt ||
+		    strcmp(sdp->device->host->hostt->name, "ufshcd"))
+			return -EINVAL;
+		if (copy_from_user(&hdr, p, sizeof(hdr)))
+			return -EFAULT;
+		if (hdr.opcode != UPIU_QUERY_OPCODE_READ_DESC)
+			return -EINVAL;
+		if (hdr.buf_size == 0 || hdr.buf_size > 256)
+			return -EINVAL;
+		kbuf = kzalloc(hdr.buf_size, GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		hba = shost_priv(sdp->device->host);
+		len = hdr.buf_size;
+		err = scsi_autopm_get_device(sdp->device);
+		if (!err) {
+			err = ufshcd_query_descriptor_retry(hba, hdr.opcode,
+							    hdr.idn, hdr.index,
+							    0, kbuf, &len);
+			scsi_autopm_put_device(sdp->device);
+		}
+		if (!err) {
+			hdr.buf_size = min_t(u16, hdr.buf_size, len);
+			if (copy_to_user((u8 __user *)p +
+					 offsetof(struct ufs_ioctl_query_hdr, buf_size),
+					 &hdr.buf_size, sizeof(hdr.buf_size)) ||
+			    copy_to_user((u8 __user *)p + sizeof(hdr),
+					 kbuf, hdr.buf_size))
+				err = -EFAULT;
+		}
+		kfree(kbuf);
+		return err;
+	}
+#endif
 	default:
 		if (read_only)
 			return -EPERM;	/* don't know so take safe approach */
