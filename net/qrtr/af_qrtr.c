@@ -523,6 +523,7 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 		goto err;
 
 	if ((cb->type == QRTR_TYPE_NEW_SERVER ||
+	     cb->type == QRTR_TYPE_DEL_SERVER ||
 	     cb->type == QRTR_TYPE_RESUME_TX) &&
 	    size < sizeof(struct qrtr_ctrl_pkt))
 		goto err;
@@ -542,18 +543,19 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 		qrtr_node_assign(node, le32_to_cpu(pkt->server.node));
 
 		/* Create a QRTR device */
-		ret = ep->add_device(ep, le32_to_cpu(pkt->server.node),
-					       le32_to_cpu(pkt->server.port),
-					       le32_to_cpu(pkt->server.service),
-					       le32_to_cpu(pkt->server.instance));
-		if (ret)
-			goto err;
-	} else if (cb->type == QRTR_TYPE_DEL_SERVER) {
+		if (ep->add_device)
+			ret = ep->add_device(ep, le32_to_cpu(pkt->server.node),
+					     le32_to_cpu(pkt->server.port),
+					     le32_to_cpu(pkt->server.service),
+					     le32_to_cpu(pkt->server.instance));
+	} else if (cb->type == QRTR_TYPE_DEL_SERVER && ep->del_device) {
 		/* Remove QRTR device corresponding to service */
-		ret = ep->del_device(ep, le32_to_cpu(pkt->server.port));
-		if (ret)
-			goto err;
+		ret = ep->del_device(ep, le32_to_cpu(pkt->server.node),
+				     le32_to_cpu(pkt->server.port));
 	}
+
+	if (ret)
+		goto err;
 
 	if (cb->type == QRTR_TYPE_RESUME_TX) {
 		qrtr_tx_resume(node, skb);

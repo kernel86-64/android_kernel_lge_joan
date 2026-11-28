@@ -8,6 +8,8 @@
 #include <linux/skbuff.h>
 #include <linux/rpmsg.h>
 #include <linux/soc/qcom/qrtr.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 #include "qrtr.h"
 
@@ -15,21 +17,18 @@ struct qrtr_smd_dev {
 	struct qrtr_endpoint ep;
 	struct rpmsg_endpoint *channel;
 	struct device *dev;
+	struct workqueue_struct *service_wq;
+	spinlock_t rx_lock; /* serialize receive with endpoint removal */
+	bool removing;
 };
 
-struct qrtr_new_server {
+struct qrtr_service_work {
 	struct qrtr_smd_dev *parent;
 	unsigned int node;
 	unsigned int port;
 	u16 service;
 	u16 instance;
-
-	struct work_struct work;
-};
-
-struct qrtr_del_server {
-	struct qrtr_smd_dev *parent;
-	unsigned int port;
+	bool announce;
 
 	struct work_struct work;
 };
@@ -108,97 +107,102 @@ static void qcom_smd_qrtr_dev_release(struct device *dev)
 	kfree(qdev);
 }
 
-static int qcom_smd_qrtr_match_device_by_port(struct device *dev, const void *data)
+static int qcom_smd_qrtr_match_device(struct device *dev, const void *data)
 {
-	struct qrtr_device *qdev = to_qrtr_device(dev);
-	unsigned const int *port = data;
+	const struct qrtr_service_work *service = data;
+	const struct qrtr_device *qdev = to_qrtr_device(dev);
 
-	return qdev->port == *port;
+	return qdev->node == service->node && qdev->port == service->port;
 }
 
-static void qcom_smd_qrtr_add_device_worker(struct work_struct *work)
+static void qcom_smd_qrtr_register_service(struct qrtr_service_work *service)
 {
-	struct qrtr_new_server *new_server = container_of(work, struct qrtr_new_server, work);
-	struct qrtr_smd_dev *qsdev = new_server->parent;
 	struct qrtr_device *qdev;
 	int ret;
 
-	qdev = kzalloc(sizeof(*qdev), GFP_KERNEL);
+	qdev = kzalloc_obj(*qdev);
 	if (!qdev)
 		return;
 
-	*qdev = (struct qrtr_device) {
-		.node = new_server->node,
-		.port = new_server->port,
-		.service = new_server->service,
-		.instance = new_server->instance
-	};
-
-	devm_kfree(qsdev->dev, new_server);
-
-	dev_set_name(&qdev->dev, "%d-%d", qdev->node, qdev->port);
-
+	qdev->node = service->node;
+	qdev->port = service->port;
+	qdev->service = service->service;
+	qdev->instance = service->instance;
+	device_initialize(&qdev->dev);
 	qdev->dev.bus = &qrtr_bus;
-	qdev->dev.parent = qsdev->dev;
+	qdev->dev.parent = service->parent->dev;
 	qdev->dev.release = qcom_smd_qrtr_dev_release;
 
-	ret = device_register(&qdev->dev);
+	ret = dev_set_name(&qdev->dev, "%u-%u", qdev->node, qdev->port);
+	if (!ret)
+		ret = device_add(&qdev->dev);
 	if (ret) {
-		dev_err(qsdev->dev, "Failed to register QRTR device: %pe\n", ERR_PTR(ret));
+		dev_err(service->parent->dev, "Failed to register QRTR device: %pe\n",
+			ERR_PTR(ret));
 		put_device(&qdev->dev);
 	}
 }
 
-static void qcom_smd_qrtr_del_device_worker(struct work_struct *work)
+static void qcom_smd_qrtr_service_worker(struct work_struct *work)
 {
-	struct qrtr_del_server *del_server = container_of(work, struct qrtr_del_server, work);
-	struct qrtr_smd_dev *qsdev = del_server->parent;
-	struct device *dev = device_find_child(qsdev->dev, &del_server->port,
-					       qcom_smd_qrtr_match_device_by_port);
+	struct qrtr_service_work *service = container_of(work, struct qrtr_service_work, work);
+	struct device *dev;
 
-	device_unregister(dev);
+	dev = device_find_child(service->parent->dev, service,
+				qcom_smd_qrtr_match_device);
+	if (dev) {
+		const struct qrtr_device *qdev = to_qrtr_device(dev);
+
+		if (service->announce && qdev->service == service->service &&
+		    qdev->instance == service->instance) {
+			put_device(dev);
+			goto out;
+		}
+
+		device_unregister(dev);
+		put_device(dev);
+	}
+
+	if (service->announce)
+		qcom_smd_qrtr_register_service(service);
+out:
+	kfree(service);
+}
+
+static int qcom_smd_qrtr_queue_service(struct qrtr_endpoint *parent, unsigned int node,
+				       unsigned int port, u16 service, u16 instance,
+				       bool announce)
+{
+	struct qrtr_smd_dev *qsdev = container_of(parent, struct qrtr_smd_dev, ep);
+	struct qrtr_service_work *event;
+
+	/* GLINK invokes the receive callback from IRQ context. */
+	event = kmalloc_obj(*event, GFP_ATOMIC);
+	if (!event)
+		return -ENOMEM;
+
+	event->parent = qsdev;
+	event->node = node;
+	event->port = port;
+	event->service = service;
+	event->instance = instance;
+	event->announce = announce;
+	INIT_WORK(&event->work, qcom_smd_qrtr_service_worker);
+	queue_work(qsdev->service_wq, &event->work);
+
+	return 0;
 }
 
 static int qcom_smd_qrtr_add_device(struct qrtr_endpoint *parent, unsigned int node,
 				    unsigned int port, u16 service, u16 instance)
 {
-	struct qrtr_smd_dev *qsdev = container_of(parent, struct qrtr_smd_dev, ep);
-	struct qrtr_new_server *new_server;
-
-	new_server = devm_kzalloc(qsdev->dev, sizeof(*new_server), GFP_KERNEL);
-	if (!new_server)
-		return -ENOMEM;
-
-	*new_server = (struct qrtr_new_server) {
-		.parent = qsdev,
-		.node = node,
-		.port = port,
-		.service = service,
-		.instance = instance
-	};
-
-	INIT_WORK(&new_server->work, qcom_smd_qrtr_add_device_worker);
-	schedule_work(&new_server->work);
-
-	return 0;
+	return qcom_smd_qrtr_queue_service(parent, node, port, service, instance, true);
 }
 
-static int qcom_smd_qrtr_del_device(struct qrtr_endpoint *parent, unsigned int port)
+static int qcom_smd_qrtr_del_device(struct qrtr_endpoint *parent, unsigned int node,
+				    unsigned int port)
 {
-	struct qrtr_smd_dev *qsdev = container_of(parent, struct qrtr_smd_dev, ep);
-	struct qrtr_del_server *del_server;
-
-	del_server = devm_kzalloc(qsdev->dev, sizeof(*del_server), GFP_KERNEL);
-	if (!del_server)
-		return -ENOMEM;
-
-	del_server->parent = qsdev;
-	del_server->port = port;
-
-	INIT_WORK(&del_server->work, qcom_smd_qrtr_del_device_worker);
-	schedule_work(&del_server->work);
-
-	return 0;
+	return qcom_smd_qrtr_queue_service(parent, node, port, 0, 0, false);
 }
 
 static int qcom_smd_qrtr_device_unregister(struct device *dev, void *data)
@@ -212,13 +216,18 @@ static int qcom_smd_qrtr_device_unregister(struct device *dev, void *data)
 static int qcom_smd_qrtr_callback(struct rpmsg_device *rpdev,
 				  void *data, int len, void *priv, u32 addr)
 {
-	struct qrtr_smd_dev *qsdev = dev_get_drvdata(&rpdev->dev);
+	struct qrtr_smd_dev *qsdev;
+	unsigned long flags;
 	int rc;
 
+	/* Pairs with the publication in qcom_smd_qrtr_probe(). */
+	qsdev = smp_load_acquire(&rpdev->dev.driver_data);
 	if (!qsdev)
 		return -EAGAIN;
 
-	rc = qrtr_endpoint_post(&qsdev->ep, data, len);
+	spin_lock_irqsave(&qsdev->rx_lock, flags);
+	rc = qsdev->removing ? -ENODEV : qrtr_endpoint_post(&qsdev->ep, data, len);
+	spin_unlock_irqrestore(&qsdev->rx_lock, flags);
 	if (rc == -EINVAL) {
 		dev_err(qsdev->dev, "invalid ipcrouter packet\n");
 		/* return 0 to let smd drop the packet */
@@ -262,12 +271,19 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 	qsdev->ep.xmit = qcom_smd_qrtr_send;
 	qsdev->ep.add_device = qcom_smd_qrtr_add_device;
 	qsdev->ep.del_device = qcom_smd_qrtr_del_device;
+	spin_lock_init(&qsdev->rx_lock);
+	qsdev->service_wq = alloc_ordered_workqueue("qrtr-%s", 0, dev_name(qsdev->dev));
+	if (!qsdev->service_wq)
+		return -ENOMEM;
 
 	rc = qrtr_endpoint_register(&qsdev->ep, QRTR_EP_NID_AUTO);
-	if (rc)
+	if (rc) {
+		destroy_workqueue(qsdev->service_wq);
 		return rc;
+	}
 
-	dev_set_drvdata(&rpdev->dev, qsdev);
+	/* Publish the initialized endpoint to the receive callback. */
+	smp_store_release(&rpdev->dev.driver_data, qsdev);
 
 	dev_dbg(&rpdev->dev, "Qualcomm SMD QRTR driver probed\n");
 
@@ -277,12 +293,19 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 static void qcom_smd_qrtr_remove(struct rpmsg_device *rpdev)
 {
 	struct qrtr_smd_dev *qsdev = dev_get_drvdata(&rpdev->dev);
+	unsigned long flags;
+
+	/* Stop new receive work before draining the queue and removing children. */
+	spin_lock_irqsave(&qsdev->rx_lock, flags);
+	qsdev->removing = true;
+	spin_unlock_irqrestore(&qsdev->rx_lock, flags);
+	destroy_workqueue(qsdev->service_wq);
 
 	device_for_each_child(qsdev->dev, NULL, qcom_smd_qrtr_device_unregister);
 
 	qrtr_endpoint_unregister(&qsdev->ep);
 
-	dev_set_drvdata(&rpdev->dev, NULL);
+	WRITE_ONCE(rpdev->dev.driver_data, NULL);
 }
 
 static const struct rpmsg_device_id qcom_smd_qrtr_smd_match[] = {

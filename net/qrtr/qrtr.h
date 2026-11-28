@@ -21,7 +21,7 @@ struct qrtr_endpoint {
 	int (*xmit)(struct qrtr_endpoint *ep, struct sk_buff *skb);
 	int (*add_device)(struct qrtr_endpoint *parent, unsigned int node, unsigned int port,
 			  u16 service, u16 instance);
-	int (*del_device)(struct qrtr_endpoint *parent, unsigned int port);
+	int (*del_device)(struct qrtr_endpoint *parent, unsigned int node, unsigned int port);
 	/* private: not for endpoint use */
 	struct qrtr_node *node;
 };
